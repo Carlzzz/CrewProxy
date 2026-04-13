@@ -1,0 +1,23 @@
+{
+  "port": 3456,
+  "host": "0.0.0.0",
+  "defaultUpstream": {
+    "baseURL": "https://ark.cn-beijing.volces.com/api/v3",
+    "apiKey": "",
+    "model": "doubao-seed-2-0-pro-260215"
+  },
+  "upstreamsById": {
+    "ali": {
+      "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "",
+      "model": "qwen3.5-plus",
+      "provider": "ali"
+    },
+    "ark": {
+      "baseURL": "https://ark.cn-beijing.volces.com/api/v3",
+      "apiKey": "",
+      "model": "doubao-seed-2-0-pro-260215",
+      "provider": "ark"
+    }
+  }
+}
