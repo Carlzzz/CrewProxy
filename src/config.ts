@@ -1,0 +1,245 @@
+import fs from "fs";
+import path from "path";
+import { logger } from "./logger";
+
+export interface UpstreamConfig {
+  baseURL: string;
+  apiKey: string;
+  model: string;
+  provider?: string;
+}
+
+export interface ProxyConfig {
+  port?: number;
+  host?: string;
+  defaultUpstream?: UpstreamConfig;
+  upstreamsById?: Record<string, UpstreamConfig>;
+  modelRoutes?: Record<string, string>;
+}
+
+export interface ProxyRuntimeContext {
+  upstreamsByIdMap: Map<string, UpstreamConfig>;
+  defaultUpstream: UpstreamConfig | undefined;
+  modelRoutesMap: Map<string, string>;
+}
+
+export interface ResolvedUpstream {
+  upstream: UpstreamConfig;
+  modelId: string;
+  upstreamRouteId: string;
+}
+
+function ensureString(v: unknown, field: string): string {
+  if (v === undefined || v === null) {
+    throw new Error(`${field} is required`);
+  }
+  if (typeof v === "string") {
+    return v;
+  }
+  return String(v);
+}
+
+export function normalizeUpstream(u: unknown): UpstreamConfig {
+  if (u === null || typeof u !== "object") {
+    throw new Error("upstream must be an object");
+  }
+  const o = u as Record<string, unknown>;
+  const baseURL = ensureString(o.baseURL, "baseURL").replace(/\/+$/, "");
+  const apiKey = ensureString(o.apiKey, "apiKey");
+  const model = ensureString(o.model, "model");
+  const out: UpstreamConfig = { baseURL, apiKey, model };
+  if (o.provider !== undefined && o.provider !== null) {
+    out.provider = ensureString(o.provider, "provider");
+  }
+  return out;
+}
+
+function readConfigFile(filePath: string): ProxyConfig {
+  try {
+    const text = fs.readFileSync(filePath, "utf8");
+    const raw: unknown = JSON.parse(text);
+    return parseProxyConfigObject(raw);
+  } catch (e) {
+    logger.error("Failed to load config file", filePath, e);
+    throw e;
+  }
+}
+
+function loadFromEnvUpstream(): ProxyConfig | null {
+  const baseURL = process.env.UPSTREAM_BASE_URL;
+  const apiKey = process.env.UPSTREAM_API_KEY;
+  const model = process.env.UPSTREAM_MODEL;
+  if (baseURL === undefined || apiKey === undefined || model === undefined) {
+    return null;
+  }
+  const config: ProxyConfig = {
+    defaultUpstream: normalizeUpstream({
+      baseURL,
+      apiKey,
+      model,
+      provider: process.env.UPSTREAM_PROVIDER,
+    }),
+  };
+  const portRaw = process.env.PORT;
+  if (portRaw !== undefined) {
+    const p = Number(portRaw);
+    if (!Number.isNaN(p)) {
+      config.port = p;
+    }
+  }
+  return config;
+}
+
+export function loadConfig(configPathArg?: string): ProxyConfig {
+  if (configPathArg !== undefined && configPathArg !== "") {
+    const resolved = path.isAbsolute(configPathArg)
+      ? configPathArg
+      : path.resolve(process.cwd(), configPathArg);
+    return readConfigFile(resolved);
+  }
+
+  const envPath = process.env.WOICLAW_PROXY_CONFIG;
+  if (envPath !== undefined && envPath !== "") {
+    const resolved = path.isAbsolute(envPath)
+      ? envPath
+      : path.resolve(process.cwd(), envPath);
+    return readConfigFile(resolved);
+  }
+
+  const defaultFile = path.join(process.cwd(), "proxy-config.json");
+  if (fs.existsSync(defaultFile)) {
+    return readConfigFile(defaultFile);
+  }
+
+  const fromEnv = loadFromEnvUpstream();
+  if (fromEnv !== null) {
+    return fromEnv;
+  }
+
+  throw new Error(
+    "No proxy configuration found: set config path, WOICLAW_PROXY_CONFIG, proxy-config.json, or UPSTREAM_* env vars",
+  );
+}
+
+export function parseProxyConfigObject(raw: unknown): ProxyConfig {
+  if (raw === null || typeof raw !== "object") {
+    throw new Error("config must be an object");
+  }
+  const r = raw as Record<string, unknown>;
+  const out: ProxyConfig = {};
+  if (typeof r.port === "number") {
+    out.port = r.port;
+  }
+  if (typeof r.host === "string") {
+    out.host = r.host;
+  }
+  if (r.defaultUpstream !== undefined) {
+    out.defaultUpstream = normalizeUpstream(r.defaultUpstream);
+  }
+  if (r.upstreamsById !== undefined) {
+    if (r.upstreamsById === null || typeof r.upstreamsById !== "object") {
+      throw new Error("upstreamsById must be an object");
+    }
+    const rec: Record<string, UpstreamConfig> = {};
+    for (const [id, u] of Object.entries(
+      r.upstreamsById as Record<string, unknown>,
+    )) {
+      rec[id] = normalizeUpstream(u);
+    }
+    out.upstreamsById = rec;
+  }
+  if (r.modelRoutes !== undefined) {
+    if (r.modelRoutes === null || typeof r.modelRoutes !== "object") {
+      throw new Error("modelRoutes must be an object");
+    }
+    const routes: Record<string, string> = {};
+    for (const [model, upstreamId] of Object.entries(
+      r.modelRoutes as Record<string, unknown>,
+    )) {
+      routes[model] = String(upstreamId);
+    }
+    out.modelRoutes = routes;
+  }
+  return out;
+}
+
+export function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext {
+  const upstreamsByIdMap = new Map<string, UpstreamConfig>();
+  if (config.upstreamsById !== undefined) {
+    for (const [id, u] of Object.entries(config.upstreamsById)) {
+      upstreamsByIdMap.set(id, u);
+    }
+  }
+  const modelRoutesMap = new Map<string, string>();
+  if (config.modelRoutes !== undefined) {
+    for (const [model, upstreamId] of Object.entries(config.modelRoutes)) {
+      modelRoutesMap.set(model, upstreamId);
+    }
+  }
+  return {
+    upstreamsByIdMap,
+    defaultUpstream: config.defaultUpstream,
+    modelRoutesMap,
+  };
+}
+
+export function resolveUpstreamFromModel(
+  modelStr: string,
+  upstreamsByIdMap: Map<string, UpstreamConfig>,
+  defaultUpstream: UpstreamConfig | undefined,
+  modelRoutesMap?: Map<string, string>,
+): ResolvedUpstream | null {
+  const pipe = modelStr.indexOf("|");
+  if (pipe !== -1) {
+    const upstreamId = modelStr.slice(0, pipe);
+    const modelIdPart = modelStr.slice(pipe + 1);
+    const named = upstreamsByIdMap.get(upstreamId);
+    if (named !== undefined) {
+      const modelId =
+        modelIdPart === "" ? named.model : modelIdPart;
+      return {
+        upstream: named,
+        modelId,
+        upstreamRouteId: upstreamId,
+      };
+    }
+    if (defaultUpstream !== undefined) {
+      const modelId =
+        modelIdPart === ""
+          ? defaultUpstream.model
+          : modelIdPart;
+      return {
+        upstream: defaultUpstream,
+        modelId,
+        upstreamRouteId: "__default__",
+      };
+    }
+    return null;
+  }
+
+  if (modelRoutesMap && modelStr !== "") {
+    const routedUpstreamId = modelRoutesMap.get(modelStr);
+    if (routedUpstreamId !== undefined) {
+      const routed = upstreamsByIdMap.get(routedUpstreamId);
+      if (routed !== undefined) {
+        return {
+          upstream: routed,
+          modelId: modelStr,
+          upstreamRouteId: routedUpstreamId,
+        };
+      }
+      logger.error(`modelRoutes maps "${modelStr}" to upstream "${routedUpstreamId}" but that upstream is not in upstreamsById`);
+    }
+  }
+
+  if (defaultUpstream === undefined) {
+    return null;
+  }
+  const modelId =
+    modelStr === "" ? defaultUpstream.model : modelStr;
+  return {
+    upstream: defaultUpstream,
+    modelId,
+    upstreamRouteId: "__default__",
+  };
+}

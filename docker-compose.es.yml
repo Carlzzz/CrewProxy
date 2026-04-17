@@ -1,0 +1,18 @@
+version: "3.8"
+services:
+  elasticsearch:
+    image: elasticsearch:8.17.0
+    container_name: claw-proxy-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    restart: unless-stopped
+
+volumes:
+  es-data:

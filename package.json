@@ -1,0 +1,22 @@
+{
+  "name": "claw-proxy",
+  "version": "1.0.0",
+  "description": "HTTP gateway: Anthropic Messages API → OpenAI compatible upstream (Chat Completions / Responses)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "sync-usage": "node dist/scripts/sync-usage-to-es.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@elastic/elasticsearch": "^8.17.0",
+    "@types/node": "^22.12.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

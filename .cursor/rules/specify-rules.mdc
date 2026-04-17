@@ -1,0 +1,34 @@
+﻿---
+description: Project Development Guidelines
+globs: ["**/*"]
+alwaysApply: true
+---
+# CrewProxy Development Guidelines
+
+Auto-generated from all feature plans. Last updated: 2026-04-13
+
+## Active Technologies
+
+- TypeScript `strict`，目标运行时 Node.js ≥ 18 + `dotenv`（环境变量）、`@elastic/elasticsearch`（ES 同步脚本，开发依赖）；`typescript`、`@types/node`（开发依赖） (001-claw-proxy-gateway)
+
+## Project Structure
+
+```text
+src/
+tests/
+```
+
+## Commands
+
+npm test; npm run lint
+
+## Code Style
+
+TypeScript `strict`，目标运行时 Node.js ≥ 18: Follow standard conventions
+
+## Recent Changes
+
+- 001-claw-proxy-gateway: Added TypeScript `strict`，目标运行时 Node.js ≥ 18 + `dotenv`（环境变量）、`@elastic/elasticsearch`（ES 同步脚本，开发依赖）；`typescript`、`@types/node`（开发依赖）
+
+<!-- MANUAL ADDITIONS START -->
+<!-- MANUAL ADDITIONS END -->
