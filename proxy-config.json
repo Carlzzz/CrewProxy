@@ -7,12 +7,6 @@
     "model": "doubao-seed-2.0-pro"
   },
   "upstreamsById": {
-    "ali": {
-      "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      "apiKey": "",
-      "model": "qwen3.5-plus",
-      "provider": "ali"
-    },
     "ark": {
       "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
       "apiKey": "f5c4d134-0025-44c6-871f-3835e292aaa1",
@@ -24,6 +18,12 @@
       "apiKey": "sk-cp-JAuqghZ2eX7kxqJDQpqOuqXulLKDTOf72Nl4J5dlp3TKkiZCnTAhikod1gP-X8p2xzvYboyCbl7yWii1WWZY9Dnnfk-i7GFEHfoKf4YqyzfYs74GLMp6tkM",
       "model": "MiniMax-M2.7-highspeed",
       "provider": "minimax"
+    },
+    "minimax2": {
+      "baseURL": "https://api.minimaxi.com/v1",
+      "apiKey": "sk-cp-TeeVHfYRRNEKsSP317d-Oe3HTb5EQ66uWeszRWPBvlV5TPcUTu1GQ0vXHvIg_Ro_1mWF4Fshc8rpR-hZiDAaO0W7Mh_1yWqHPoj1YMk3o4l6KK_rzqQvTh8",
+      "model": "MiniMax-M2.7",
+      "provider": "minimax"
     }
   },
   "modelRoutes": {
@@ -31,6 +31,7 @@
     "doubao-seed-2.0-code": "ark",
     "glm-4.7": "ark",
     "kimi-k2.5": "ark",
-    "MiniMax-M2.7-highspeed": "minimax"
+    "MiniMax-M2.7-highspeed": "minimax",
+    "MiniMax-M2.7": "minimax2"
   }
 }
