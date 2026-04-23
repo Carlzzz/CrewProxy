@@ -41,6 +41,7 @@ const logger_1 = require("./logger");
 const config_1 = require("./config");
 const formatTransform_1 = require("./formatTransform");
 const usageLogger_1 = require("./usageLogger");
+const contextBudget_1 = require("./contextBudget");
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 90_000;
 const MAX_TOOL_CALL_EXTRA_CONTENT_CACHE = 1024;
@@ -1106,6 +1107,22 @@ async function handleRequest(req, res, ctx) {
     else if (parsedBody.stream) {
         upstreamRequestBody.stream = true;
     }
+    // ─── Context budget: pre-flight trim ───
+    {
+        const effectiveModel = modelId || upstream.model;
+        const requestedMaxOutput = upstreamRequestBody.max_tokens
+            || upstreamRequestBody.max_completion_tokens
+            || upstreamRequestBody.max_output_tokens;
+        const inputBudget = (0, contextBudget_1.computeInputBudget)(effectiveModel, requestedMaxOutput);
+        const estimated = (0, contextBudget_1.estimateRequestTokens)(upstreamRequestBody);
+        if (estimated > inputBudget) {
+            const trimResult = (0, contextBudget_1.trimToFitBudget)(upstreamRequestBody, inputBudget);
+            if (trimResult.trimmed) {
+                upstreamRequestBody = trimResult.trimmedBody;
+                logger_1.logger.verbose(`[${reqId}] Context budget: trimmed from ~${estimated} to ~${trimResult.estimatedTokens} tokens (budget: ${inputBudget}). Actions: ${trimResult.actions.join('; ')}`);
+            }
+        }
+    }
     const targetURLs = (0, formatTransform_1.buildUpstreamTargetUrls)(upstream.baseURL, upstreamAPIType, upstream.provider);
     const sessionId = req.headers['x-woicrew-session-id'];
     const usageExtra = {
@@ -1189,6 +1206,24 @@ async function handleRequest(req, res, ctx) {
                 if (retryResp.ok || retryResp.status !== 400)
                     upstreamResponse = retryResp;
             }
+        }
+        for (let trimRound = 0; trimRound < 3; trimRound++) {
+            if (upstreamResponse.ok || upstreamResponse.status !== 400)
+                break;
+            try {
+                bodyText = await upstreamResponse.clone().text();
+            }
+            catch { }
+            if (!(0, contextBudget_1.isTokenExceedError)(upstreamResponse.status, bodyText))
+                break;
+            upstreamRequestBody = (0, contextBudget_1.aggressiveTrimForRetry)(upstreamRequestBody, trimRound);
+            logger_1.logger.verbose(`[${reqId}] Token exceed error, retry round ${trimRound + 1}/3 with aggressively trimmed context`);
+            const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${upstream.apiKey}` },
+                body: JSON.stringify(upstreamRequestBody),
+            });
+            upstreamResponse = retryResp;
         }
     }
     if (!upstreamResponse.ok) {

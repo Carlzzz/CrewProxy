@@ -1289,18 +1289,19 @@ async function handleRequest(
       }
     }
 
-    if (!upstreamResponse.ok && upstreamResponse.status === 400) {
+    for (let trimRound = 0; trimRound < 3; trimRound++) {
+      if (upstreamResponse.ok || upstreamResponse.status !== 400) break;
       try { bodyText = await upstreamResponse.clone().text(); } catch {}
-      if (isTokenExceedError(upstreamResponse.status, bodyText)) {
-        upstreamRequestBody = aggressiveTrimForRetry(upstreamRequestBody);
-        logger.verbose(`[${reqId}] Token exceed error, retrying with aggressively trimmed context`);
-        const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${upstream.apiKey}` },
-          body: JSON.stringify(upstreamRequestBody),
-        });
-        if (retryResp.ok || retryResp.status !== 400) upstreamResponse = retryResp;
-      }
+      if (!isTokenExceedError(upstreamResponse.status, bodyText)) break;
+
+      upstreamRequestBody = aggressiveTrimForRetry(upstreamRequestBody, trimRound);
+      logger.verbose(`[${reqId}] Token exceed error, retry round ${trimRound + 1}/3 with aggressively trimmed context`);
+      const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${upstream.apiKey}` },
+        body: JSON.stringify(upstreamRequestBody),
+      });
+      upstreamResponse = retryResp;
     }
   }
 

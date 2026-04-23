@@ -17,7 +17,9 @@ const MODEL_CONTEXT_SPECS: ModelContextSpec[] = [
   { pattern: /^gemini-2/i,        contextWindow: 1_048_576, maxOutputTokens: 8_192 },
   { pattern: /^gemini-1\.5/i,     contextWindow: 1_048_576, maxOutputTokens: 8_192 },
   { pattern: /^deepseek/i,        contextWindow: 64_000,    maxOutputTokens: 8_192 },
+  { pattern: /^qwen3\.5/i,        contextWindow: 262_144,   maxOutputTokens: 16_384 },
   { pattern: /^qwen/i,            contextWindow: 131_072,   maxOutputTokens: 8_192 },
+  { pattern: /^doubao-seed/i,     contextWindow: 128_000,   maxOutputTokens: 8_192 },
   { pattern: /^doubao/i,          contextWindow: 128_000,   maxOutputTokens: 4_096 },
   { pattern: /^minimax/i,         contextWindow: 245_760,   maxOutputTokens: 16_384 },
   { pattern: /^claude/i,          contextWindow: 200_000,   maxOutputTokens: 8_192 },
@@ -121,7 +123,7 @@ export function estimateRequestTokens(body: any): number {
 export function computeInputBudget(modelId: string, requestedMaxOutput?: number): number {
   const spec = getModelContextWindow(modelId);
   const maxOutput = requestedMaxOutput || spec.maxOutputTokens;
-  const budget = Math.floor((spec.contextWindow - maxOutput) * 0.90);
+  const budget = Math.floor((spec.contextWindow - maxOutput) * 0.85);
   return Math.max(budget, 1024);
 }
 
@@ -302,11 +304,10 @@ export function isTokenExceedError(status: number, bodyText: string): boolean {
 
 // ─── Aggressive trim for retry ──────────────────────────────────────────────
 
-export function aggressiveTrimForRetry(body: any): any {
+export function aggressiveTrimForRetry(body: any, round: number = 0): any {
   const trimmed = JSON.parse(JSON.stringify(body));
   const messages: any[] = trimmed.messages || trimmed.input || [];
 
-  // Remove all images
   for (const msg of messages) {
     replaceImagesWithPlaceholder(msg);
     if (msg._synthetic_image) {
@@ -314,22 +315,34 @@ export function aggressiveTrimForRetry(body: any): any {
     }
   }
 
-  // Remove oldest 50% of non-system, non-last messages
   let firstNonSystem = 0;
   while (firstNonSystem < messages.length && isSystemMessage(messages[firstNonSystem])) {
     firstNonSystem++;
   }
   const protectFrom = findProtectedTailIndex(messages);
   const removableCount = protectFrom - firstNonSystem;
-  const toRemove = Math.ceil(removableCount / 2);
+
+  // round 0: remove 50%, round 1: 75%, round 2+: 90%
+  const removeFraction = round === 0 ? 0.5 : round === 1 ? 0.75 : 0.9;
+  const toRemove = Math.ceil(removableCount * removeFraction);
   if (toRemove > 0) {
     messages.splice(firstNonSystem, toRemove);
   }
 
-  // Truncate tool result content
+  // Truncate tool result content — more aggressively on later rounds
+  const toolMaxLen = round === 0 ? 2000 : round === 1 ? 500 : 200;
   for (const msg of messages) {
-    if (msg.role === 'tool' && typeof msg.content === 'string' && msg.content.length > 2000) {
-      msg.content = msg.content.slice(0, 2000) + '\n[...truncated]';
+    if (msg.role === 'tool' && typeof msg.content === 'string' && msg.content.length > toolMaxLen) {
+      msg.content = msg.content.slice(0, toolMaxLen) + '\n[...truncated]';
+    }
+  }
+
+  // Round 2+: also truncate long system messages
+  if (round >= 2) {
+    for (const msg of messages) {
+      if (isSystemMessage(msg) && typeof msg.content === 'string' && msg.content.length > 4000) {
+        msg.content = msg.content.slice(0, 4000) + '\n[...system prompt truncated to fit context]';
+      }
     }
   }
 
