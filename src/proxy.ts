@@ -140,12 +140,35 @@ async function authenticateRequest(token: string): Promise<{ name: string } | nu
     return { name: 'bypass' };
   }
 
+  const authHost = getAuthHost();
   const proxyKey = getProxyApiKey();
-  if (proxyKey) {
-    return token === proxyKey ? { name: 'local' } : null;
+
+  // 如果配置了 introspect 端点，优先尝试 introspect
+  if (authHost) {
+    logger.verbose('[auth] Trying introspect first (authHost configured)');
+    const userInfo = await fetchUserInfo(token);
+    if (userInfo) {
+      logger.verbose('[auth] Introspect succeeded, got user:', userInfo.name);
+      return userInfo;
+    }
+    logger.verbose('[auth] Introspect failed, falling back');
   }
 
-  return fetchUserInfo(token);
+  // fallback 到 proxy key 逻辑
+  if (proxyKey) {
+    if (token === proxyKey) {
+      return { name: 'local' };
+    }
+    return null;
+  }
+
+  return null;
+}
+
+function isLikelyJwt(token: string): boolean {
+  // JWT 格式: xxxxx.yyyyy.zzzzz
+  const parts = token.split('.');
+  return parts.length === 3;
 }
 
 async function fetchUserInfo(token: string): Promise<{ name: string } | null> {
@@ -1151,10 +1174,21 @@ async function handleRequest(
   // 优先从 header 读取用户名（效率更高）
   let userInfo: { name: string } | null = null;
   const xUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
+  logger.verbose(`[${reqId}] Auth debug:`, {
+    hasXllmProxyUser: !!req.headers['x-llm-proxy-user'],
+    hasXShowName: !!req.headers['x-show-name'],
+    xUserValue: xUser ? `${xUser.substring(0, 20)}...` : undefined,
+    clientIdLength: clientId?.length,
+    clientIdPrefix: clientId ? `${clientId.substring(0, 20)}...` : undefined,
+    isLikelyJwt: clientId ? isLikelyJwt(clientId) : false,
+  });
+
   if (typeof xUser === 'string' && xUser.trim()) {
     userInfo = { name: xUser.trim() };
+    logger.verbose(`[${reqId}] Using username from header:`, userInfo.name);
   } else {
     userInfo = await authenticateRequest(clientId);
+    logger.verbose(`[${reqId}] Using username from authenticateRequest:`, userInfo?.name);
   }
   if (!userInfo) {
     sendErrorResponse(res, 401, 'Authentication failed', 'authentication_error');
