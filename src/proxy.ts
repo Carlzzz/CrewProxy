@@ -43,6 +43,10 @@ function getAuthNameField(): string {
   return process.env.WOICLAW_AUTH_NAME_FIELD || 'data.name';
 }
 
+function useAuthBearerToken(): boolean {
+  return process.env.WOICLAW_AUTH_USE_BEARER === '1' || process.env.WOICLAW_AUTH_USE_BEARER === 'true';
+}
+
 function getNestedField(obj: any, path: string): any {
   const parts = path.split('.');
   let current = obj;
@@ -153,10 +157,21 @@ async function fetchUserInfo(token: string): Promise<{ name: string } | null> {
 
   const method = getAuthMethod();
   const tokenParam = getAuthTokenParam();
+  const useBearer = useAuthBearerToken();
   let url: string;
   let fetchOptions: RequestInit;
 
-  if (method === 'GET') {
+  if (useBearer) {
+    // 使用 Bearer token 方式（CrewCentral introspect 端点）
+    url = `${authHost}${getAuthUserPath()}`;
+    fetchOptions = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+    };
+  } else if (method === 'GET') {
     url = `${authHost}${getAuthUserPath()}?${tokenParam}=${encodeURIComponent(token)}`;
     fetchOptions = { method: 'GET' };
   } else {
@@ -1133,7 +1148,14 @@ async function handleRequest(
   }
   const clientId = clientApiKeyRaw || 'bypass';
 
-  const userInfo = await authenticateRequest(clientId);
+  // 优先从 header 读取用户名（效率更高）
+  let userInfo: { name: string } | null = null;
+  const xUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
+  if (typeof xUser === 'string' && xUser.trim()) {
+    userInfo = { name: xUser.trim() };
+  } else {
+    userInfo = await authenticateRequest(clientId);
+  }
   if (!userInfo) {
     sendErrorResponse(res, 401, 'Authentication failed', 'authentication_error');
     return;
