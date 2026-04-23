@@ -24,19 +24,13 @@
       "apiKey": "sk-cp-TeeVHfYRRNEKsSP317d-Oe3HTb5EQ66uWeszRWPBvlV5TPcUTu1GQ0vXHvIg_Ro_1mWF4Fshc8rpR-hZiDAaO0W7Mh_1yWqHPoj1YMk3o4l6KK_rzqQvTh8",
       "model": "MiniMax-M2.7",
       "provider": "minimax"
-    },
-    "kimi": {
-      "baseURL": "https://api.kimi.com/coding/v1",
-      "apiKey": "sk-kimi-yK6lTbvkOfGzXiedP8sf5F71xCzIdgViwc3UKp2zpncGeUVd3VRFTUaQmdWjDO79",
-      "model": "kimi-k2.6",
-      "provider": "kimi"
     }
   },
   "modelRoutes": {
     "doubao-seed-2.0-pro": "ark",
     "doubao-seed-2.0-code": "ark",
     "glm-5.1": "ark",
-    "kimi-k2.6": "kimi",
+    "kimi-k2.5": "ark",
     "MiniMax-M2.7-highspeed": "minimax",
     "MiniMax-M2.7": "minimax2"
   }
