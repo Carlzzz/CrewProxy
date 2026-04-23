@@ -1173,7 +1173,8 @@ async function handleRequest(
 
   // 优先从 header 读取用户名（效率更高）
   let userInfo: { name: string } | null = null;
-  const xUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
+  const xUserRaw = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
+  const xUser = Array.isArray(xUserRaw) ? xUserRaw[0] : xUserRaw;
   logger.verbose(`[${reqId}] Auth debug:`, {
     hasXllmProxyUser: !!req.headers['x-llm-proxy-user'],
     hasXShowName: !!req.headers['x-show-name'],
