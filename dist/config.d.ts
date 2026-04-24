@@ -4,17 +4,21 @@ export interface UpstreamConfig {
     model: string;
     provider?: string;
 }
+export interface ModelRouteTarget {
+    upstream: string;
+    model?: string;
+}
 export interface ProxyConfig {
     port?: number;
     host?: string;
     defaultUpstream?: UpstreamConfig;
     upstreamsById?: Record<string, UpstreamConfig>;
-    modelRoutes?: Record<string, string>;
+    modelRoutes?: Record<string, string | ModelRouteTarget>;
 }
 export interface ProxyRuntimeContext {
     upstreamsByIdMap: Map<string, UpstreamConfig>;
     defaultUpstream: UpstreamConfig | undefined;
-    modelRoutesMap: Map<string, string>;
+    modelRoutesMap: Map<string, ModelRouteTarget>;
 }
 export interface ResolvedUpstream {
     upstream: UpstreamConfig;
@@ -24,5 +28,6 @@ export interface ResolvedUpstream {
 export declare function normalizeUpstream(u: unknown): UpstreamConfig;
 export declare function loadConfig(configPathArg?: string): ProxyConfig;
 export declare function parseProxyConfigObject(raw: unknown): ProxyConfig;
+export declare function normalizeModelRouteTarget(v: string | ModelRouteTarget): ModelRouteTarget;
 export declare function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext;
-export declare function resolveUpstreamFromModel(modelStr: string, upstreamsByIdMap: Map<string, UpstreamConfig>, defaultUpstream: UpstreamConfig | undefined, modelRoutesMap?: Map<string, string>): ResolvedUpstream | null;
+export declare function resolveUpstreamFromModel(modelStr: string, upstreamsByIdMap: Map<string, UpstreamConfig>, defaultUpstream: UpstreamConfig | undefined, modelRoutesMap?: Map<string, ModelRouteTarget>): ResolvedUpstream | null;

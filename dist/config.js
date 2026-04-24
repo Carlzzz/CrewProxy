@@ -6,6 +6,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.normalizeUpstream = normalizeUpstream;
 exports.loadConfig = loadConfig;
 exports.parseProxyConfigObject = parseProxyConfigObject;
+exports.normalizeModelRouteTarget = normalizeModelRouteTarget;
 exports.buildUpstreamsByIdMap = buildUpstreamsByIdMap;
 exports.resolveUpstreamFromModel = resolveUpstreamFromModel;
 const fs_1 = __importDefault(require("fs"));
@@ -123,12 +124,27 @@ function parseProxyConfigObject(raw) {
             throw new Error("modelRoutes must be an object");
         }
         const routes = {};
-        for (const [model, upstreamId] of Object.entries(r.modelRoutes)) {
-            routes[model] = String(upstreamId);
+        for (const [model, target] of Object.entries(r.modelRoutes)) {
+            if (target !== null && typeof target === "object") {
+                const t = target;
+                routes[model] = {
+                    upstream: String(t.upstream),
+                    model: t.model !== undefined ? String(t.model) : undefined,
+                };
+            }
+            else {
+                routes[model] = String(target);
+            }
         }
         out.modelRoutes = routes;
     }
     return out;
+}
+function normalizeModelRouteTarget(v) {
+    if (typeof v === "string") {
+        return { upstream: v };
+    }
+    return v;
 }
 function buildUpstreamsByIdMap(config) {
     const upstreamsByIdMap = new Map();
@@ -139,8 +155,8 @@ function buildUpstreamsByIdMap(config) {
     }
     const modelRoutesMap = new Map();
     if (config.modelRoutes !== undefined) {
-        for (const [model, upstreamId] of Object.entries(config.modelRoutes)) {
-            modelRoutesMap.set(model, upstreamId);
+        for (const [model, target] of Object.entries(config.modelRoutes)) {
+            modelRoutesMap.set(model, normalizeModelRouteTarget(target));
         }
     }
     return {
@@ -176,17 +192,18 @@ function resolveUpstreamFromModel(modelStr, upstreamsByIdMap, defaultUpstream, m
         return null;
     }
     if (modelRoutesMap && modelStr !== "") {
-        const routedUpstreamId = modelRoutesMap.get(modelStr);
-        if (routedUpstreamId !== undefined) {
-            const routed = upstreamsByIdMap.get(routedUpstreamId);
+        const routeTarget = modelRoutesMap.get(modelStr);
+        if (routeTarget !== undefined) {
+            const routed = upstreamsByIdMap.get(routeTarget.upstream);
             if (routed !== undefined) {
+                const modelId = routeTarget.model ?? modelStr;
                 return {
                     upstream: routed,
-                    modelId: modelStr,
-                    upstreamRouteId: routedUpstreamId,
+                    modelId,
+                    upstreamRouteId: routeTarget.upstream,
                 };
             }
-            logger_1.logger.error(`modelRoutes maps "${modelStr}" to upstream "${routedUpstreamId}" but that upstream is not in upstreamsById`);
+            logger_1.logger.error(`modelRoutes maps "${modelStr}" to upstream "${routeTarget.upstream}" but that upstream is not in upstreamsById`);
         }
     }
     if (defaultUpstream === undefined) {

@@ -9,18 +9,23 @@ export interface UpstreamConfig {
   provider?: string;
 }
 
+export interface ModelRouteTarget {
+  upstream: string;
+  model?: string;
+}
+
 export interface ProxyConfig {
   port?: number;
   host?: string;
   defaultUpstream?: UpstreamConfig;
   upstreamsById?: Record<string, UpstreamConfig>;
-  modelRoutes?: Record<string, string>;
+  modelRoutes?: Record<string, string | ModelRouteTarget>;
 }
 
 export interface ProxyRuntimeContext {
   upstreamsByIdMap: Map<string, UpstreamConfig>;
   defaultUpstream: UpstreamConfig | undefined;
-  modelRoutesMap: Map<string, string>;
+  modelRoutesMap: Map<string, ModelRouteTarget>;
 }
 
 export interface ResolvedUpstream {
@@ -152,15 +157,30 @@ export function parseProxyConfigObject(raw: unknown): ProxyConfig {
     if (r.modelRoutes === null || typeof r.modelRoutes !== "object") {
       throw new Error("modelRoutes must be an object");
     }
-    const routes: Record<string, string> = {};
-    for (const [model, upstreamId] of Object.entries(
+    const routes: Record<string, string | ModelRouteTarget> = {};
+    for (const [model, target] of Object.entries(
       r.modelRoutes as Record<string, unknown>,
     )) {
-      routes[model] = String(upstreamId);
+      if (target !== null && typeof target === "object") {
+        const t = target as Record<string, unknown>;
+        routes[model] = {
+          upstream: String(t.upstream),
+          model: t.model !== undefined ? String(t.model) : undefined,
+        };
+      } else {
+        routes[model] = String(target);
+      }
     }
     out.modelRoutes = routes;
   }
   return out;
+}
+
+export function normalizeModelRouteTarget(v: string | ModelRouteTarget): ModelRouteTarget {
+  if (typeof v === "string") {
+    return { upstream: v };
+  }
+  return v;
 }
 
 export function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext {
@@ -170,10 +190,10 @@ export function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext 
       upstreamsByIdMap.set(id, u);
     }
   }
-  const modelRoutesMap = new Map<string, string>();
+  const modelRoutesMap = new Map<string, ModelRouteTarget>();
   if (config.modelRoutes !== undefined) {
-    for (const [model, upstreamId] of Object.entries(config.modelRoutes)) {
-      modelRoutesMap.set(model, upstreamId);
+    for (const [model, target] of Object.entries(config.modelRoutes)) {
+      modelRoutesMap.set(model, normalizeModelRouteTarget(target));
     }
   }
   return {
@@ -187,7 +207,7 @@ export function resolveUpstreamFromModel(
   modelStr: string,
   upstreamsByIdMap: Map<string, UpstreamConfig>,
   defaultUpstream: UpstreamConfig | undefined,
-  modelRoutesMap?: Map<string, string>,
+  modelRoutesMap?: Map<string, ModelRouteTarget>,
 ): ResolvedUpstream | null {
   const pipe = modelStr.indexOf("|");
   if (pipe !== -1) {
@@ -218,17 +238,18 @@ export function resolveUpstreamFromModel(
   }
 
   if (modelRoutesMap && modelStr !== "") {
-    const routedUpstreamId = modelRoutesMap.get(modelStr);
-    if (routedUpstreamId !== undefined) {
-      const routed = upstreamsByIdMap.get(routedUpstreamId);
+    const routeTarget = modelRoutesMap.get(modelStr);
+    if (routeTarget !== undefined) {
+      const routed = upstreamsByIdMap.get(routeTarget.upstream);
       if (routed !== undefined) {
+        const modelId = routeTarget.model ?? modelStr;
         return {
           upstream: routed,
-          modelId: modelStr,
-          upstreamRouteId: routedUpstreamId,
+          modelId,
+          upstreamRouteId: routeTarget.upstream,
         };
       }
-      logger.error(`modelRoutes maps "${modelStr}" to upstream "${routedUpstreamId}" but that upstream is not in upstreamsById`);
+      logger.error(`modelRoutes maps "${modelStr}" to upstream "${routeTarget.upstream}" but that upstream is not in upstreamsById`);
     }
   }
 

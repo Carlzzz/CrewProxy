@@ -24,6 +24,18 @@
       "apiKey": "sk-cp-TeeVHfYRRNEKsSP317d-Oe3HTb5EQ66uWeszRWPBvlV5TPcUTu1GQ0vXHvIg_Ro_1mWF4Fshc8rpR-hZiDAaO0W7Mh_1yWqHPoj1YMk3o4l6KK_rzqQvTh8",
       "model": "MiniMax-M2.7",
       "provider": "minimax"
+    },
+    "minimax3": {
+      "baseURL": "https://api.minimaxi.com/v1",
+      "apiKey": "sk-cp-2aFOo5BIpiyqfptxJ3gp7lWh0evRo-8LbU10PBvrt2FGPdXCSg2Ep8INmEK2i5SAEHw5JDa5kZ-OBaYVwH8PITOqMx1C8xqWF0MZfSDhvUfLdfbNYg7Rm7Y",
+      "model": "MiniMax-M2.7-highspeed",
+      "provider": "minimax"
+    },
+    "minimax4": {
+      "baseURL": "https://api.minimaxi.com/v1",
+      "apiKey": "sk-cp-pXHf6Ge5terTsh7bJnEc16t6hGpo5C-giuAcHqprwKVfeuFoNOSKycJfGAkVrgvlXTry5Z0Hxf9m5cIlPruwhvFMZuiIypHSGDIWbFz1bVywOC0HuSgW8Ms",
+      "model": "MiniMax-M2.7-highspeed",
+      "provider": "minimax"
     }
   },
   "modelRoutes": {
@@ -32,6 +44,8 @@
     "glm-5.1": "ark",
     "kimi-k2.5": "ark",
     "MiniMax-M2.7-highspeed": "minimax",
-    "MiniMax-M2.7": "minimax2"
+    "MiniMax-M2.7": "minimax2",
+    "minimax2.7-hs-1": { "upstream": "minimax3", "model": "MiniMax-M2.7-highspeed" },
+    "minimax2.7-hs-2": { "upstream": "minimax4", "model": "MiniMax-M2.7-highspeed" }
   }
 }

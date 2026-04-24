@@ -68,6 +68,9 @@ function getAuthSuccessValue() {
 function getAuthNameField() {
     return process.env.WOICLAW_AUTH_NAME_FIELD || 'data.name';
 }
+function useAuthBearerToken() {
+    return process.env.WOICLAW_AUTH_USE_BEARER === '1' || process.env.WOICLAW_AUTH_USE_BEARER === 'true';
+}
 function getNestedField(obj, path) {
     const parts = path.split('.');
     let current = obj;
@@ -147,11 +150,31 @@ async function authenticateRequest(token) {
     if (isAuthBypassed()) {
         return { name: 'bypass' };
     }
+    const authHost = getAuthHost();
     const proxyKey = getProxyApiKey();
-    if (proxyKey) {
-        return token === proxyKey ? { name: 'local' } : null;
+    // 如果配置了 introspect 端点，优先尝试 introspect
+    if (authHost) {
+        logger_1.logger.verbose('[auth] Trying introspect first (authHost configured)');
+        const userInfo = await fetchUserInfo(token);
+        if (userInfo) {
+            logger_1.logger.verbose('[auth] Introspect succeeded, got user:', userInfo.name);
+            return userInfo;
+        }
+        logger_1.logger.verbose('[auth] Introspect failed, falling back');
     }
-    return fetchUserInfo(token);
+    // fallback 到 proxy key 逻辑
+    if (proxyKey) {
+        if (token === proxyKey) {
+            return { name: 'local' };
+        }
+        return null;
+    }
+    return null;
+}
+function isLikelyJwt(token) {
+    // JWT 格式: xxxxx.yyyyy.zzzzz
+    const parts = token.split('.');
+    return parts.length === 3;
 }
 async function fetchUserInfo(token) {
     const authHost = getAuthHost();
@@ -161,9 +184,21 @@ async function fetchUserInfo(token) {
     }
     const method = getAuthMethod();
     const tokenParam = getAuthTokenParam();
+    const useBearer = useAuthBearerToken();
     let url;
     let fetchOptions;
-    if (method === 'GET') {
+    if (useBearer) {
+        // 使用 Bearer token 方式（CrewCentral introspect 端点）
+        url = `${authHost}${getAuthUserPath()}`;
+        fetchOptions = {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+            },
+        };
+    }
+    else if (method === 'GET') {
         url = `${authHost}${getAuthUserPath()}?${tokenParam}=${encodeURIComponent(token)}`;
         fetchOptions = { method: 'GET' };
     }
@@ -1063,7 +1098,26 @@ async function handleRequest(req, res, ctx) {
         return;
     }
     const clientId = clientApiKeyRaw || 'bypass';
-    const userInfo = await authenticateRequest(clientId);
+    // 优先从 header 读取用户名（效率更高）
+    let userInfo = null;
+    const xUserRaw = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
+    const xUser = Array.isArray(xUserRaw) ? xUserRaw[0] : xUserRaw;
+    logger_1.logger.verbose(`[${reqId}] Auth debug:`, {
+        hasXllmProxyUser: !!req.headers['x-llm-proxy-user'],
+        hasXShowName: !!req.headers['x-show-name'],
+        xUserValue: xUser ? `${xUser.substring(0, 20)}...` : undefined,
+        clientIdLength: clientId?.length,
+        clientIdPrefix: clientId ? `${clientId.substring(0, 20)}...` : undefined,
+        isLikelyJwt: clientId ? isLikelyJwt(clientId) : false,
+    });
+    if (typeof xUser === 'string' && xUser.trim()) {
+        userInfo = { name: xUser.trim() };
+        logger_1.logger.verbose(`[${reqId}] Using username from header:`, userInfo.name);
+    }
+    else {
+        userInfo = await authenticateRequest(clientId);
+        logger_1.logger.verbose(`[${reqId}] Using username from authenticateRequest:`, userInfo?.name);
+    }
     if (!userInfo) {
         sendErrorResponse(res, 401, 'Authentication failed', 'authentication_error');
         return;
