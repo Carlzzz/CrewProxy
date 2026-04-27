@@ -1111,7 +1111,13 @@ async function handleRequest(req, res, ctx) {
         isLikelyJwt: clientId ? isLikelyJwt(clientId) : false,
     });
     if (typeof xUser === 'string' && xUser.trim()) {
-        userInfo = { name: xUser.trim() };
+        // 客户端用 encodeURIComponent 编码非 ASCII 用户名，此处还原
+        let decoded = xUser.trim();
+        try {
+            decoded = decodeURIComponent(decoded);
+        }
+        catch { }
+        userInfo = { name: decoded };
         logger_1.logger.verbose(`[${reqId}] Using username from header:`, userInfo.name);
     }
     else {
