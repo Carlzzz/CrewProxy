@@ -1185,7 +1185,10 @@ async function handleRequest(
   });
 
   if (typeof xUser === 'string' && xUser.trim()) {
-    userInfo = { name: xUser.trim() };
+    // 客户端用 encodeURIComponent 编码非 ASCII 用户名，此处还原
+    let decoded = xUser.trim();
+    try { decoded = decodeURIComponent(decoded); } catch {}
+    userInfo = { name: decoded };
     logger.verbose(`[${reqId}] Using username from header:`, userInfo.name);
   } else {
     userInfo = await authenticateRequest(clientId);
