@@ -1,8 +1,19 @@
+export interface CodePlanCredential {
+    id: string;
+    apiKey: string;
+    model?: string;
+    weight: number;
+    enabled: boolean;
+}
 export interface UpstreamConfig {
     baseURL: string;
     apiKey: string;
     model: string;
     provider?: string;
+    codePlanCredentials?: CodePlanCredential[];
+    codePlanBaseURL?: string;
+    codePlanAnthropicBaseURL?: string;
+    ordinaryFallbackModelMap?: Record<string, string>;
 }
 export interface ModelRouteTarget {
     upstream: string;
@@ -19,7 +30,9 @@ export interface ProxyRuntimeContext {
     upstreamsByIdMap: Map<string, UpstreamConfig>;
     defaultUpstream: UpstreamConfig | undefined;
     modelRoutesMap: Map<string, ModelRouteTarget>;
+    codePlanPool?: CodePlanPoolManager;
 }
+import type { CodePlanPoolManager } from './codePlanPool';
 export interface ResolvedUpstream {
     upstream: UpstreamConfig;
     modelId: string;

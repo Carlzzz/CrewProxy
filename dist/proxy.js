@@ -39,6 +39,8 @@ exports.createProxyServer = createProxyServer;
 const http = __importStar(require("http"));
 const logger_1 = require("./logger");
 const config_1 = require("./config");
+const codePlanPool_1 = require("./codePlanPool");
+const codePlanQuota_1 = require("./codePlanQuota");
 const formatTransform_1 = require("./formatTransform");
 const usageLogger_1 = require("./usageLogger");
 const contextBudget_1 = require("./contextBudget");
@@ -1135,9 +1137,31 @@ async function handleRequest(req, res, ctx) {
     }
     const { upstream, modelId, upstreamRouteId } = resolved;
     logger_1.logger.verbose(`[${reqId}] Upstream: ${upstreamRouteId}, model: ${modelId}, provider: ${upstream.provider || 'default'}`);
+    const sessionId = req.headers['x-woicrew-session-id'];
+    // ─── Code Plan credential selection ───
+    let effectiveApiKey = upstream.apiKey;
+    let effectiveModel = modelId || upstream.model;
+    let effectiveBaseURL = upstream.baseURL;
+    const codePlanPoolKey = upstreamRouteId || '__default__';
+    let pickedCredentialId = null;
+    if (ctx.codePlanPool && upstream.codePlanCredentials?.length) {
+        const pick = ctx.codePlanPool.pickOrFallback(codePlanPoolKey, typeof sessionId === 'string' ? sessionId : undefined);
+        pickedCredentialId = pick.credentialId;
+        if (pick.credentialId !== null) {
+            effectiveApiKey = pick.apiKey;
+            if (pick.model)
+                effectiveModel = pick.model;
+            if (pick.baseURL)
+                effectiveBaseURL = pick.baseURL;
+            logger_1.logger.verbose(`[${reqId}] CodePlan pick: ${pick.credentialId} -> effectiveModel: ${effectiveModel}`);
+        }
+        else {
+            logger_1.logger.verbose(`[${reqId}] CodePlan: no available credential, using ordinary key`);
+        }
+    }
     const openAIReq = (0, formatTransform_1.anthropicToOpenAI)(parsedBody);
     // Provider pipeline (strict order, do not reorder)
-    openAIReq.model = modelId || upstream.model;
+    openAIReq.model = effectiveModel;
     const provider = upstream.provider?.toLowerCase();
     if (provider && provider !== 'anthropic' && provider !== 'openai') {
         if (/^claude-/.test(openAIReq.model)) {
@@ -1183,15 +1207,14 @@ async function handleRequest(req, res, ctx) {
             }
         }
     }
-    const targetURLs = (0, formatTransform_1.buildUpstreamTargetUrls)(upstream.baseURL, upstreamAPIType, upstream.provider);
-    const sessionId = req.headers['x-woicrew-session-id'];
+    const targetURLs = (0, formatTransform_1.buildUpstreamTargetUrls)(effectiveBaseURL, upstreamAPIType, upstream.provider);
     const usageExtra = {
         app: 'woicrew',
         username: userInfo.name,
         stream: parsedBody.stream === true,
         request_size: rawBody.length,
         session_id: typeof sessionId === 'string' && sessionId ? sessionId : null,
-        routing_key: upstreamRouteId,
+        routing_key: pickedCredentialId ?? upstreamRouteId,
     };
     const USAGE_LOG_INPUT_FULLTEXT = process.env.WOICLAW_USAGE_LOG_INPUT_FULLTEXT;
     if (USAGE_LOG_INPUT_FULLTEXT === '1' || USAGE_LOG_INPUT_FULLTEXT === 'true') {
@@ -1206,7 +1229,7 @@ async function handleRequest(req, res, ctx) {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
-                    Authorization: `Bearer ${upstream.apiKey}`,
+                    Authorization: `Bearer ${effectiveApiKey}`,
                 },
                 body: JSON.stringify(upstreamRequestBody),
             });
@@ -1289,19 +1312,26 @@ async function handleRequest(req, res, ctx) {
     if (!upstreamResponse.ok) {
         let errText = '';
         try {
-            errText = await upstreamResponse.text();
+            errText = await upstreamResponse.clone().text();
         }
         catch { }
         logger_1.logger.verbose(`[${reqId}] Upstream error ${upstreamResponse.status}:`, errText.substring(0, 500));
+        // Code Plan cooldown: if 429 quota exceeded, mark credential in cooldown
+        if (pickedCredentialId !== null && (0, codePlanQuota_1.isQuotaLimitedResponse)(upstreamResponse.status, errText)) {
+            const resetMs = (0, codePlanQuota_1.parseQuotaResetEpochMs)(errText);
+            const cooldownMs = resetMs ? Math.max(resetMs - Date.now(), codePlanPool_1.CODE_PLAN_COOLDOWN_MS) : codePlanPool_1.CODE_PLAN_COOLDOWN_MS;
+            ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs);
+            logger_1.logger.verbose(`[${reqId}] CodePlan cooldown triggered for ${pickedCredentialId}: ${cooldownMs}ms`);
+        }
         sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
         return;
     }
     if (parsedBody.stream) {
         if (upstreamAPIType === 'responses') {
-            await handleResponsesStreamResponse(upstreamResponse, req, res, clientId, modelId || upstream.model, startTime, upstreamRequestBody, usageExtra);
+            await handleResponsesStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra);
         }
         else {
-            await handleChatCompletionsStreamResponse(upstreamResponse, req, res, clientId, modelId || upstream.model, startTime, upstreamRequestBody, usageExtra, upstream.provider);
+            await handleChatCompletionsStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, upstream.provider);
         }
         return;
     }
@@ -1320,7 +1350,7 @@ async function handleRequest(req, res, ctx) {
     const inputContent = buildTrimmedInputContentForUsageLog(upstreamRequestBody);
     const outputContent = extractOutputContentFromAnthropicResponse(anthropicResp);
     const respUsage = anthropicResp.usage || { input_tokens: 0, output_tokens: 0 };
-    (0, usageLogger_1.appendUsageLog)(clientId, modelId || upstream.model, startTime, respUsage.input_tokens || 0, respUsage.output_tokens || 0, {
+    (0, usageLogger_1.appendUsageLog)(clientId, effectiveModel, startTime, respUsage.input_tokens || 0, respUsage.output_tokens || 0, {
         ...usageExtra,
         input_cached_token: extractCachedInputTokensFromUsage(upstreamBody.usage),
         input_content: inputContent,

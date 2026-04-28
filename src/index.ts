@@ -3,6 +3,7 @@ import * as path from 'path';
 import { config as dotenvConfig } from 'dotenv';
 import { loadConfig, parseProxyConfigObject, buildUpstreamsByIdMap, ProxyConfig } from './config';
 import { createProxyServer } from './proxy';
+import { CodePlanPoolManager } from './codePlanPool';
 import { logger } from './logger';
 
 dotenvConfig();
@@ -18,6 +19,12 @@ try {
 }
 
 const ctx = buildUpstreamsByIdMap(currentConfig);
+
+// Initialize Code Plan credential pool
+const codePlanPool = new CodePlanPoolManager();
+codePlanPool.reconcileFromConfig(currentConfig);
+ctx.codePlanPool = codePlanPool;
+
 const port = currentConfig.port || 3456;
 const host = currentConfig.host || '0.0.0.0';
 
@@ -53,6 +60,7 @@ if (fs.existsSync(configFilePath)) {
         ctx.upstreamsByIdMap = newCtx.upstreamsByIdMap;
         ctx.defaultUpstream = newCtx.defaultUpstream;
         ctx.modelRoutesMap = newCtx.modelRoutesMap;
+        codePlanPool.reconcileFromConfig(newConfig);
         currentConfig = newConfig;
 
         logger.info('Config reloaded successfully');

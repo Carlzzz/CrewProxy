@@ -38,6 +38,7 @@ const path = __importStar(require("path"));
 const dotenv_1 = require("dotenv");
 const config_1 = require("./config");
 const proxy_1 = require("./proxy");
+const codePlanPool_1 = require("./codePlanPool");
 const logger_1 = require("./logger");
 (0, dotenv_1.config)();
 const configPathArg = process.argv[2];
@@ -50,6 +51,10 @@ catch (err) {
     process.exit(1);
 }
 const ctx = (0, config_1.buildUpstreamsByIdMap)(currentConfig);
+// Initialize Code Plan credential pool
+const codePlanPool = new codePlanPool_1.CodePlanPoolManager();
+codePlanPool.reconcileFromConfig(currentConfig);
+ctx.codePlanPool = codePlanPool;
 const port = currentConfig.port || 3456;
 const host = currentConfig.host || '0.0.0.0';
 const server = (0, proxy_1.createProxyServer)(ctx);
@@ -80,6 +85,7 @@ if (fs.existsSync(configFilePath)) {
                 ctx.upstreamsByIdMap = newCtx.upstreamsByIdMap;
                 ctx.defaultUpstream = newCtx.defaultUpstream;
                 ctx.modelRoutesMap = newCtx.modelRoutesMap;
+                codePlanPool.reconcileFromConfig(newConfig);
                 currentConfig = newConfig;
                 logger_1.logger.info('Config reloaded successfully');
             }

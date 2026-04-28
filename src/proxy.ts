@@ -1,6 +1,8 @@
 import * as http from 'http';
 import { logger } from './logger';
 import { ProxyRuntimeContext, UpstreamConfig, ResolvedUpstream, resolveUpstreamFromModel } from './config';
+import { CodePlanPoolManager, CODE_PLAN_COOLDOWN_MS } from './codePlanPool';
+import { isQuotaLimitedResponse, parseQuotaResetEpochMs } from './codePlanQuota';
 import { anthropicToOpenAI, openAIToAnthropic, buildUpstreamTargetUrls } from './formatTransform';
 import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
 import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry } from './contextBudget';
@@ -1208,10 +1210,32 @@ async function handleRequest(
   const { upstream, modelId, upstreamRouteId } = resolved;
   logger.verbose(`[${reqId}] Upstream: ${upstreamRouteId}, model: ${modelId}, provider: ${upstream.provider || 'default'}`);
 
+  const sessionId = req.headers['x-woicrew-session-id'];
+
+  // ─── Code Plan credential selection ───
+  let effectiveApiKey = upstream.apiKey;
+  let effectiveModel = modelId || upstream.model;
+  let effectiveBaseURL = upstream.baseURL;
+  const codePlanPoolKey = upstreamRouteId || '__default__';
+  let pickedCredentialId: string | null = null;
+
+  if (ctx.codePlanPool && upstream.codePlanCredentials?.length) {
+    const pick = ctx.codePlanPool.pickOrFallback(codePlanPoolKey, typeof sessionId === 'string' ? sessionId : undefined);
+    pickedCredentialId = pick.credentialId;
+    if (pick.credentialId !== null) {
+      effectiveApiKey = pick.apiKey;
+      if (pick.model) effectiveModel = pick.model;
+      if (pick.baseURL) effectiveBaseURL = pick.baseURL;
+      logger.verbose(`[${reqId}] CodePlan pick: ${pick.credentialId} -> effectiveModel: ${effectiveModel}`);
+    } else {
+      logger.verbose(`[${reqId}] CodePlan: no available credential, using ordinary key`);
+    }
+  }
+
   const openAIReq = anthropicToOpenAI(parsedBody);
 
   // Provider pipeline (strict order, do not reorder)
-  openAIReq.model = modelId || upstream.model;
+  openAIReq.model = effectiveModel;
 
   const provider = upstream.provider?.toLowerCase();
   if (provider && provider !== 'anthropic' && provider !== 'openai') {
@@ -1264,16 +1288,15 @@ async function handleRequest(
     }
   }
 
-  const targetURLs = buildUpstreamTargetUrls(upstream.baseURL, upstreamAPIType, upstream.provider);
+  const targetURLs = buildUpstreamTargetUrls(effectiveBaseURL, upstreamAPIType, upstream.provider);
 
-  const sessionId = req.headers['x-woicrew-session-id'];
   const usageExtra: Partial<UsageLogExtra> = {
     app: 'woicrew',
     username: userInfo.name,
     stream: parsedBody.stream === true,
     request_size: rawBody.length,
     session_id: typeof sessionId === 'string' && sessionId ? sessionId : null,
-    routing_key: upstreamRouteId,
+    routing_key: pickedCredentialId ?? upstreamRouteId,
   };
 
   const USAGE_LOG_INPUT_FULLTEXT = process.env.WOICLAW_USAGE_LOG_INPUT_FULLTEXT;
@@ -1291,7 +1314,7 @@ async function handleRequest(
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${upstream.apiKey}`,
+          Authorization: `Bearer ${effectiveApiKey}`,
         },
         body: JSON.stringify(upstreamRequestBody),
       });
@@ -1367,17 +1390,26 @@ async function handleRequest(
 
   if (!upstreamResponse.ok) {
     let errText = '';
-    try { errText = await upstreamResponse.text(); } catch {}
+    try { errText = await upstreamResponse.clone().text(); } catch {}
     logger.verbose(`[${reqId}] Upstream error ${upstreamResponse.status}:`, errText.substring(0, 500));
+
+    // Code Plan cooldown: if 429 quota exceeded, mark credential in cooldown
+    if (pickedCredentialId !== null && isQuotaLimitedResponse(upstreamResponse.status, errText)) {
+      const resetMs = parseQuotaResetEpochMs(errText);
+      const cooldownMs = resetMs ? Math.max(resetMs - Date.now(), CODE_PLAN_COOLDOWN_MS) : CODE_PLAN_COOLDOWN_MS;
+      ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs);
+      logger.verbose(`[${reqId}] CodePlan cooldown triggered for ${pickedCredentialId}: ${cooldownMs}ms`);
+    }
+
     sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
     return;
   }
 
   if (parsedBody.stream) {
     if (upstreamAPIType === 'responses') {
-      await handleResponsesStreamResponse(upstreamResponse, req, res, clientId, modelId || upstream.model, startTime, upstreamRequestBody, usageExtra);
+      await handleResponsesStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra);
     } else {
-      await handleChatCompletionsStreamResponse(upstreamResponse, req, res, clientId, modelId || upstream.model, startTime, upstreamRequestBody, usageExtra, upstream.provider);
+      await handleChatCompletionsStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, upstream.provider);
     }
     return;
   }
@@ -1400,7 +1432,7 @@ async function handleRequest(
   const outputContent = extractOutputContentFromAnthropicResponse(anthropicResp);
   const respUsage = anthropicResp.usage || { input_tokens: 0, output_tokens: 0 };
 
-  appendUsageLog(clientId, modelId || upstream.model, startTime, respUsage.input_tokens || 0, respUsage.output_tokens || 0, {
+  appendUsageLog(clientId, effectiveModel, startTime, respUsage.input_tokens || 0, respUsage.output_tokens || 0, {
     ...usageExtra,
     input_cached_token: extractCachedInputTokensFromUsage(upstreamBody.usage),
     input_content: inputContent,

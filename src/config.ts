@@ -2,11 +2,23 @@ import fs from "fs";
 import path from "path";
 import { logger } from "./logger";
 
+export interface CodePlanCredential {
+  id: string;
+  apiKey: string;
+  model?: string;
+  weight: number;
+  enabled: boolean;
+}
+
 export interface UpstreamConfig {
   baseURL: string;
   apiKey: string;
   model: string;
   provider?: string;
+  codePlanCredentials?: CodePlanCredential[];
+  codePlanBaseURL?: string;
+  codePlanAnthropicBaseURL?: string;
+  ordinaryFallbackModelMap?: Record<string, string>;
 }
 
 export interface ModelRouteTarget {
@@ -26,7 +38,10 @@ export interface ProxyRuntimeContext {
   upstreamsByIdMap: Map<string, UpstreamConfig>;
   defaultUpstream: UpstreamConfig | undefined;
   modelRoutesMap: Map<string, ModelRouteTarget>;
+  codePlanPool?: CodePlanPoolManager;
 }
+
+import type { CodePlanPoolManager } from './codePlanPool';
 
 export interface ResolvedUpstream {
   upstream: UpstreamConfig;
@@ -55,6 +70,29 @@ export function normalizeUpstream(u: unknown): UpstreamConfig {
   const out: UpstreamConfig = { baseURL, apiKey, model };
   if (o.provider !== undefined && o.provider !== null) {
     out.provider = ensureString(o.provider, "provider");
+  }
+  if (Array.isArray(o.codePlanCredentials)) {
+    out.codePlanCredentials = o.codePlanCredentials
+      .filter((c): c is Record<string, unknown> => c !== null && typeof c === 'object')
+      .map(c => ({
+        id: String(c.id ?? ''),
+        apiKey: String(c.apiKey ?? ''),
+        model: c.model !== undefined ? String(c.model) : undefined,
+        weight: typeof c.weight === 'number' ? c.weight : 1,
+        enabled: c.enabled !== false,
+      }));
+  }
+  if (typeof o.codePlanBaseURL === 'string' && o.codePlanBaseURL) {
+    out.codePlanBaseURL = o.codePlanBaseURL.replace(/\/+$/, '');
+  }
+  if (typeof o.codePlanAnthropicBaseURL === 'string' && o.codePlanAnthropicBaseURL) {
+    out.codePlanAnthropicBaseURL = o.codePlanAnthropicBaseURL.replace(/\/+$/, '');
+  }
+  if (o.ordinaryFallbackModelMap !== undefined && o.ordinaryFallbackModelMap !== null && typeof o.ordinaryFallbackModelMap === 'object') {
+    out.ordinaryFallbackModelMap = Object.fromEntries(
+      Object.entries(o.ordinaryFallbackModelMap as Record<string, unknown>)
+        .map(([k, v]) => [k, String(v)])
+    );
   }
   return out;
 }

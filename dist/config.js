@@ -33,6 +33,27 @@ function normalizeUpstream(u) {
     if (o.provider !== undefined && o.provider !== null) {
         out.provider = ensureString(o.provider, "provider");
     }
+    if (Array.isArray(o.codePlanCredentials)) {
+        out.codePlanCredentials = o.codePlanCredentials
+            .filter((c) => c !== null && typeof c === 'object')
+            .map(c => ({
+            id: String(c.id ?? ''),
+            apiKey: String(c.apiKey ?? ''),
+            model: c.model !== undefined ? String(c.model) : undefined,
+            weight: typeof c.weight === 'number' ? c.weight : 1,
+            enabled: c.enabled !== false,
+        }));
+    }
+    if (typeof o.codePlanBaseURL === 'string' && o.codePlanBaseURL) {
+        out.codePlanBaseURL = o.codePlanBaseURL.replace(/\/+$/, '');
+    }
+    if (typeof o.codePlanAnthropicBaseURL === 'string' && o.codePlanAnthropicBaseURL) {
+        out.codePlanAnthropicBaseURL = o.codePlanAnthropicBaseURL.replace(/\/+$/, '');
+    }
+    if (o.ordinaryFallbackModelMap !== undefined && o.ordinaryFallbackModelMap !== null && typeof o.ordinaryFallbackModelMap === 'object') {
+        out.ordinaryFallbackModelMap = Object.fromEntries(Object.entries(o.ordinaryFallbackModelMap)
+            .map(([k, v]) => [k, String(v)]));
+    }
     return out;
 }
 function readConfigFile(filePath) {
