@@ -6,8 +6,6 @@ export interface CodePlanPickResult {
   apiKey: string;
   model?: string;
   upstreamKey: string;
-  baseURL?: string;
-  anthropicBaseURL?: string;
 }
 
 export interface CredentialHeatmap {
@@ -57,21 +55,39 @@ export class CodePlanPoolManager {
       return { credentialId: null, apiKey: '', upstreamKey };
     }
 
-    const available = credentials.filter(c => !this.isInCooldown(upstreamKey, c.id));
-    if (available.length === 0) {
+    // Build available set (not in cooldown), preserving order
+    const availableIndices: number[] = [];
+    for (let i = 0; i < credentials.length; i++) {
+      if (!this.isInCooldown(upstreamKey, credentials[i].id)) {
+        availableIndices.push(i);
+      }
+    }
+    if (availableIndices.length === 0) {
       return { credentialId: null, apiKey: '', upstreamKey };
     }
 
-    let selected: CodePlanCredential;
+    let selectedIdx: number;
     if (sessionId) {
-      const slot = this.sessionIdToCodePlanSlot(sessionId, available.length);
-      selected = available[slot];
+      // Hash to slot on the FULL list, then probe for first available
+      const startSlot = this.sessionIdToCodePlanSlot(sessionId, credentials.length);
+      let found = -1;
+      for (let probe = 0; probe < credentials.length; probe++) {
+        const idx = (startSlot + probe) % credentials.length;
+        if (availableIndices.includes(idx)) {
+          found = idx;
+          break;
+        }
+      }
+      // Should always find one since availableIndices.length > 0
+      selectedIdx = found >= 0 ? found : availableIndices[0];
     } else {
-      const idx = (this.roundRobin.get(upstreamKey) ?? 0) % available.length;
-      this.roundRobin.set(upstreamKey, idx + 1);
-      selected = available[idx];
+      // Round-robin on available set
+      const rrIdx = (this.roundRobin.get(upstreamKey) ?? 0) % availableIndices.length;
+      this.roundRobin.set(upstreamKey, rrIdx + 1);
+      selectedIdx = availableIndices[rrIdx];
     }
 
+    const selected = credentials[selectedIdx];
     return {
       credentialId: selected.id,
       apiKey: selected.apiKey,
@@ -139,8 +155,4 @@ export class CodePlanPoolManager {
     }
     return hash % Math.max(length, 1);
   }
-}
-
-function now(): number {
-  return Date.now();
 }

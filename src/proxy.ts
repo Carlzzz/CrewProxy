@@ -1225,10 +1225,18 @@ async function handleRequest(
     if (pick.credentialId !== null) {
       effectiveApiKey = pick.apiKey;
       if (pick.model) effectiveModel = pick.model;
-      if (pick.baseURL) effectiveBaseURL = pick.baseURL;
+      if (upstream.codePlanBaseURL) effectiveBaseURL = upstream.codePlanBaseURL;
       logger.verbose(`[${reqId}] CodePlan pick: ${pick.credentialId} -> effectiveModel: ${effectiveModel}`);
     } else {
       logger.verbose(`[${reqId}] CodePlan: no available credential, using ordinary key`);
+      // ordinaryFallbackModelMap: remap model when falling back to ordinary key
+      if (upstream.ordinaryFallbackModelMap) {
+        const mapped = upstream.ordinaryFallbackModelMap[effectiveModel];
+        if (mapped) {
+          effectiveModel = mapped;
+          logger.verbose(`[${reqId}] CodePlan ordinary fallback model remap: ${modelId || upstream.model} -> ${mapped}`);
+        }
+      }
     }
   }
 
@@ -1296,7 +1304,7 @@ async function handleRequest(
     stream: parsedBody.stream === true,
     request_size: rawBody.length,
     session_id: typeof sessionId === 'string' && sessionId ? sessionId : null,
-    routing_key: pickedCredentialId ?? upstreamRouteId,
+    routing_key: pickedCredentialId ?? upstreamRouteId ?? '__default__',
   };
 
   const USAGE_LOG_INPUT_FULLTEXT = process.env.WOICLAW_USAGE_LOG_INPUT_FULLTEXT;
