@@ -5,10 +5,10 @@ import { CodePlanPoolManager, CODE_PLAN_COOLDOWN_MS } from './codePlanPool';
 import { isQuotaLimitedResponse, parseQuotaResetEpochMs } from './codePlanQuota';
 import { anthropicToOpenAI, openAIToAnthropic, buildUpstreamTargetUrls } from './formatTransform';
 import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
-import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry } from './contextBudget';
+import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow } from './contextBudget';
 
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
-const STREAM_READ_TIMEOUT_MS = 90_000;
+const STREAM_READ_TIMEOUT_MS = 180_000;
 const MAX_TOOL_CALL_EXTRA_CONTENT_CACHE = 1024;
 const GEMINI_FALLBACK_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 
@@ -522,6 +522,7 @@ interface StreamState {
   /** MiniMax OpenAI-compat: each chunk may carry full text prefix, not only new tokens. */
   lastCumulativeText?: string;
   lastCumulativeThinking?: string;
+  emittedMessageDelta: boolean;
 }
 
 function createStreamState(): StreamState {
@@ -535,6 +536,7 @@ function createStreamState(): StreamState {
     outputAccumulator: [],
     messageId: '',
     messageModel: '',
+    emittedMessageDelta: false,
   };
 }
 
@@ -549,7 +551,9 @@ function closeCurrentBlockIfNeeded(state: StreamState, res: http.ServerResponse)
 function ensureMessageStart(state: StreamState, res: http.ServerResponse, chunk: any): void {
   if (state.messageStarted) return;
   state.messageId = chunk.id || `msg_${Date.now()}`;
-  state.messageModel = chunk.model || '';
+  if (!state.messageModel) {
+    state.messageModel = chunk.model || '';
+  }
   state.messageStarted = true;
   res.write(formatSSEEvent('message_start', {
     type: 'message_start',
@@ -633,17 +637,17 @@ function mergeUsageIntoState(state: StreamState, usage: { input_tokens: number; 
   state.lastUsage.input_cached_token = Math.max(state.lastUsage.input_cached_token, usage.input_cached_token);
 }
 
-function mapStopReason(reason: string | null | undefined): string {
-  if (!reason) return 'end_turn';
+function mapStopReason(reason: string | null | undefined): string | null {
+  if (reason == null) return null;
   switch (reason) {
     case 'stop': return 'end_turn';
     case 'length': return 'max_tokens';
     case 'tool_calls': case 'function_call': return 'tool_use';
-    default: return 'end_turn';
+    default: return null;
   }
 }
 
-function emitMessageDelta(state: StreamState, res: http.ServerResponse, finishReason: string, chunkUsage?: any): void {
+function emitMessageDelta(state: StreamState, res: http.ServerResponse, finishReason: string | null, chunkUsage?: any): void {
   closeCurrentBlockIfNeeded(state, res);
   const usageForDelta = chunkUsage ? {
     input_tokens: chunkUsage.prompt_tokens ?? chunkUsage.input_tokens ?? 0,
@@ -655,11 +659,20 @@ function emitMessageDelta(state: StreamState, res: http.ServerResponse, finishRe
     delta: { stop_reason: mapStopReason(finishReason) },
     usage: usageForDelta,
   }));
+  state.emittedMessageDelta = true;
 }
 
 function flushDone(state: StreamState, res: http.ServerResponse): void {
   if (state.messageStarted && !state.messageStopped) {
     closeCurrentBlockIfNeeded(state, res);
+    if (!state.emittedMessageDelta) {
+      res.write(formatSSEEvent('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: null },
+        usage: { input_tokens: state.lastUsage.input_tokens, output_tokens: state.lastUsage.output_tokens },
+      }));
+      state.emittedMessageDelta = true;
+    }
     if (!state.messageStopped) {
       res.write(formatSSEEvent('message_stop', { type: 'message_stop' }));
       state.messageStopped = true;
@@ -844,6 +857,7 @@ async function handleChatCompletionsStreamResponse(
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
 
   const state = createStreamState();
+  state.messageModel = modelid;
   const streamOpts: OpenAIStreamChunkOptions = {
     minimaxCumulativeDelta: upstreamProvider?.toLowerCase() === 'minimax',
   };
@@ -912,7 +926,7 @@ async function handleChatCompletionsStreamResponse(
       res.write(formatSSEEvent('error', { type: 'error', error: { type: 'api_error', message: String(err) } }));
     }
   } finally {
-    try { reader.cancel(); } catch {}
+    reader.cancel().catch(() => {});
     flushDone(state, res);
 
     const inputContent = buildTrimmedInputContentForUsageLog(upstreamReq);
@@ -947,6 +961,7 @@ async function handleResponsesStreamResponse(
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
 
   const state = createStreamState();
+  state.messageModel = modelid;
   const rctx: ResponsesStreamContext = { functionCalls: new Map() };
   const body = upstreamResponse.body;
   if (!body) {
@@ -1007,7 +1022,7 @@ async function handleResponsesStreamResponse(
       res.write(formatSSEEvent('error', { type: 'error', error: { type: 'api_error', message: String(err) } }));
     }
   } finally {
-    try { reader.cancel(); } catch {}
+    reader.cancel().catch(() => {});
     flushDone(state, res);
 
     const inputContent = buildTrimmedInputContentForUsageLog(upstreamReq);
@@ -1244,6 +1259,19 @@ async function handleRequest(
 
   // Provider pipeline (strict order, do not reorder)
   openAIReq.model = effectiveModel;
+
+  // 动态设置 max_tokens：若未指定或低于模型上限，提升到该模型支持的最大输出 token
+  {
+    const { maxOutputTokens } = getModelContextWindow(openAIReq.model);
+    if (maxOutputTokens > 0) {
+      const currentMax = openAIReq.max_tokens ?? openAIReq.max_completion_tokens ?? 0;
+      if (!currentMax || currentMax < maxOutputTokens) {
+        openAIReq.max_tokens = maxOutputTokens;
+        delete openAIReq.max_completion_tokens;
+        logger.verbose(`[${reqId}] Auto-set max_tokens to ${maxOutputTokens} for model ${openAIReq.model} (was ${currentMax || 'unset'})`);
+      }
+    }
+  }
 
   const provider = upstream.provider?.toLowerCase();
   if (provider && provider !== 'anthropic' && provider !== 'openai') {
@@ -1515,6 +1543,38 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
 
       if (method === 'POST' && pathname === '/v1/messages') {
         await handleRequest(req, res, ctx);
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/pool-status') {
+        if (!ctx.codePlanPool) {
+          sendJSONResponse(res, 200, { pools: {} });
+          return;
+        }
+        const pools: Record<string, { credentials: Array<{ id: string; model?: string; inCooldown: boolean; cooldownUntil?: number }> }> = {};
+        const allKeys = new Set<string>();
+        for (const [upstreamId] of ctx.upstreamsByIdMap) allKeys.add(upstreamId);
+        allKeys.add('__default__');
+        for (const key of allKeys) {
+          if (!ctx.codePlanPool.hasCredentials(key)) continue;
+          const status = ctx.codePlanPool.getPoolStatus(key);
+          pools[key] = {
+            credentials: status.map(c => ({
+              id: c.credentialId,
+              inCooldown: c.inCooldown,
+              cooldownUntil: c.cooldownUntil,
+            })),
+          };
+          // Attach model info from config
+          const upstream = ctx.upstreamsByIdMap.get(key) ?? ctx.defaultUpstream;
+          if (upstream?.codePlanCredentials) {
+            for (const cred of upstream.codePlanCredentials) {
+              const entry = pools[key].credentials.find(c => c.id === cred.id);
+              if (entry && cred.model) entry.model = cred.model;
+            }
+          }
+        }
+        sendJSONResponse(res, 200, { pools });
         return;
       }
 

@@ -28,6 +28,25 @@ ctx.codePlanPool = codePlanPool;
 const port = currentConfig.port || 3456;
 const host = currentConfig.host || '0.0.0.0';
 
+// 防止 undici 内部 Fetch 因 socket 错误（ECONNRESET 等）抛出 TypeError: terminated
+// 导致未处理的 Promise rejection 使进程崩溃
+process.on('unhandledRejection', (reason) => {
+  if (reason instanceof Error && reason.message === 'terminated') {
+    logger.warn('Suppressed unhandled rejection: terminated (upstream connection lost)');
+    return;
+  }
+  logger.error('Unhandled rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  if (err instanceof Error && err.message === 'terminated') {
+    logger.warn('Suppressed uncaught exception: terminated (upstream connection lost)');
+    return;
+  }
+  logger.error('Uncaught exception:', err);
+  process.exit(1);
+});
+
 const server = createProxyServer(ctx);
 
 server.listen(port, host, () => {

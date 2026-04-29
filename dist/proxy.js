@@ -45,7 +45,7 @@ const formatTransform_1 = require("./formatTransform");
 const usageLogger_1 = require("./usageLogger");
 const contextBudget_1 = require("./contextBudget");
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
-const STREAM_READ_TIMEOUT_MS = 90_000;
+const STREAM_READ_TIMEOUT_MS = 180_000;
 const MAX_TOOL_CALL_EXTRA_CONTENT_CACHE = 1024;
 const GEMINI_FALLBACK_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
 const USAGE_LOG_TAIL_PREVIEW_MAX = Math.max(4096, parseInt(process.env.WOICLAW_USAGE_LOG_TAIL_PREVIEW_MAX || '8192', 10) || 8192);
@@ -516,6 +516,7 @@ function createStreamState() {
         outputAccumulator: [],
         messageId: '',
         messageModel: '',
+        emittedMessageDelta: false,
     };
 }
 function closeCurrentBlockIfNeeded(state, res) {
@@ -529,7 +530,9 @@ function ensureMessageStart(state, res, chunk) {
     if (state.messageStarted)
         return;
     state.messageId = chunk.id || `msg_${Date.now()}`;
-    state.messageModel = chunk.model || '';
+    if (!state.messageModel) {
+        state.messageModel = chunk.model || '';
+    }
     state.messageStarted = true;
     res.write(formatSSEEvent('message_start', {
         type: 'message_start',
@@ -616,14 +619,14 @@ function mergeUsageIntoState(state, usage) {
     state.lastUsage.input_cached_token = Math.max(state.lastUsage.input_cached_token, usage.input_cached_token);
 }
 function mapStopReason(reason) {
-    if (!reason)
-        return 'end_turn';
+    if (reason == null)
+        return null;
     switch (reason) {
         case 'stop': return 'end_turn';
         case 'length': return 'max_tokens';
         case 'tool_calls':
         case 'function_call': return 'tool_use';
-        default: return 'end_turn';
+        default: return null;
     }
 }
 function emitMessageDelta(state, res, finishReason, chunkUsage) {
@@ -637,10 +640,19 @@ function emitMessageDelta(state, res, finishReason, chunkUsage) {
         delta: { stop_reason: mapStopReason(finishReason) },
         usage: usageForDelta,
     }));
+    state.emittedMessageDelta = true;
 }
 function flushDone(state, res) {
     if (state.messageStarted && !state.messageStopped) {
         closeCurrentBlockIfNeeded(state, res);
+        if (!state.emittedMessageDelta) {
+            res.write(formatSSEEvent('message_delta', {
+                type: 'message_delta',
+                delta: { stop_reason: null },
+                usage: { input_tokens: state.lastUsage.input_tokens, output_tokens: state.lastUsage.output_tokens },
+            }));
+            state.emittedMessageDelta = true;
+        }
         if (!state.messageStopped) {
             res.write(formatSSEEvent('message_stop', { type: 'message_stop' }));
             state.messageStopped = true;
@@ -810,6 +822,7 @@ function readWithTimeout(reader, timeoutMs, abortSignal) {
 async function handleChatCompletionsStreamResponse(upstreamResponse, req, res, clientid, modelid, startTime, upstreamReq, extra, upstreamProvider) {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     const state = createStreamState();
+    state.messageModel = modelid;
     const streamOpts = {
         minimaxCumulativeDelta: upstreamProvider?.toLowerCase() === 'minimax',
     };
@@ -877,10 +890,7 @@ async function handleChatCompletionsStreamResponse(upstreamResponse, req, res, c
         }
     }
     finally {
-        try {
-            reader.cancel();
-        }
-        catch { }
+        reader.cancel().catch(() => { });
         flushDone(state, res);
         const inputContent = buildTrimmedInputContentForUsageLog(upstreamReq);
         const outputContent = state.outputAccumulator.join('');
@@ -896,6 +906,7 @@ async function handleChatCompletionsStreamResponse(upstreamResponse, req, res, c
 async function handleResponsesStreamResponse(upstreamResponse, req, res, clientid, modelid, startTime, upstreamReq, extra) {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     const state = createStreamState();
+    state.messageModel = modelid;
     const rctx = { functionCalls: new Map() };
     const body = upstreamResponse.body;
     if (!body) {
@@ -957,10 +968,7 @@ async function handleResponsesStreamResponse(upstreamResponse, req, res, clienti
         }
     }
     finally {
-        try {
-            reader.cancel();
-        }
-        catch { }
+        reader.cancel().catch(() => { });
         flushDone(state, res);
         const inputContent = buildTrimmedInputContentForUsageLog(upstreamReq);
         const outputContent = state.outputAccumulator.join('');
@@ -1170,6 +1178,18 @@ async function handleRequest(req, res, ctx) {
     const openAIReq = (0, formatTransform_1.anthropicToOpenAI)(parsedBody);
     // Provider pipeline (strict order, do not reorder)
     openAIReq.model = effectiveModel;
+    // 动态设置 max_tokens：若未指定或低于模型上限，提升到该模型支持的最大输出 token
+    {
+        const { maxOutputTokens } = (0, contextBudget_1.getModelContextWindow)(openAIReq.model);
+        if (maxOutputTokens > 0) {
+            const currentMax = openAIReq.max_tokens ?? openAIReq.max_completion_tokens ?? 0;
+            if (!currentMax || currentMax < maxOutputTokens) {
+                openAIReq.max_tokens = maxOutputTokens;
+                delete openAIReq.max_completion_tokens;
+                logger_1.logger.verbose(`[${reqId}] Auto-set max_tokens to ${maxOutputTokens} for model ${openAIReq.model} (was ${currentMax || 'unset'})`);
+            }
+        }
+    }
     const provider = upstream.provider?.toLowerCase();
     if (provider && provider !== 'anthropic' && provider !== 'openai') {
         if (/^claude-/.test(openAIReq.model)) {
@@ -1422,6 +1442,40 @@ function createProxyServer(ctx) {
             }
             if (method === 'POST' && pathname === '/v1/messages') {
                 await handleRequest(req, res, ctx);
+                return;
+            }
+            if (method === 'GET' && pathname === '/pool-status') {
+                if (!ctx.codePlanPool) {
+                    sendJSONResponse(res, 200, { pools: {} });
+                    return;
+                }
+                const pools = {};
+                const allKeys = new Set();
+                for (const [upstreamId] of ctx.upstreamsByIdMap)
+                    allKeys.add(upstreamId);
+                allKeys.add('__default__');
+                for (const key of allKeys) {
+                    if (!ctx.codePlanPool.hasCredentials(key))
+                        continue;
+                    const status = ctx.codePlanPool.getPoolStatus(key);
+                    pools[key] = {
+                        credentials: status.map(c => ({
+                            id: c.credentialId,
+                            inCooldown: c.inCooldown,
+                            cooldownUntil: c.cooldownUntil,
+                        })),
+                    };
+                    // Attach model info from config
+                    const upstream = ctx.upstreamsByIdMap.get(key) ?? ctx.defaultUpstream;
+                    if (upstream?.codePlanCredentials) {
+                        for (const cred of upstream.codePlanCredentials) {
+                            const entry = pools[key].credentials.find(c => c.id === cred.id);
+                            if (entry && cred.model)
+                                entry.model = cred.model;
+                        }
+                    }
+                }
+                sendJSONResponse(res, 200, { pools });
                 return;
             }
             sendErrorResponse(res, 404, `Not found: ${method} ${url}`, 'not_found_error');
