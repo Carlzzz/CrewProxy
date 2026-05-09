@@ -1,7 +1,7 @@
 {
   "name": "claw-proxy",
   "version": "1.0.0",
-  "description": "HTTP gateway: Anthropic Messages API → OpenAI compatible upstream (Chat Completions / Responses)",
+  "description": "Anthropic Messages API proxy with context budget management",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",

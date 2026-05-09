@@ -2,19 +2,19 @@
   "port": 3456,
   "host": "0.0.0.0",
   "defaultUpstream": {
-    "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "baseURL": "https://ark.cn-beijing.volces.com/api/coding",
     "apiKey": "f5c4d134-0025-44c6-871f-3835e292aaa1",
     "model": "doubao-seed-2.0-pro"
   },
   "upstreamsById": {
     "ark": {
-      "baseURL": "https://ark.cn-beijing.volces.com/api/coding/v3",
+      "baseURL": "https://ark.cn-beijing.volces.com/api/coding",
       "apiKey": "f5c4d134-0025-44c6-871f-3835e292aaa1",
       "model": "doubao-seed-2.0-pro",
       "provider": "ark"
     },
     "minimax": {
-      "baseURL": "https://api.minimaxi.com/v1",
+      "baseURL": "https://api.minimaxi.com/anthropic",
       "apiKey": "sk-cp-JAuqghZ2eX7kxqJDQpqOuqXulLKDTOf72Nl4J5dlp3TKkiZCnTAhikod1gP-X8p2xzvYboyCbl7yWii1WWZY9Dnnfk-i7GFEHfoKf4YqyzfYs74GLMp6tkM",
       "model": "MiniMax-M2.7-highspeed",
       "provider": "minimax",
