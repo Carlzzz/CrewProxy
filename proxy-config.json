@@ -31,8 +31,6 @@
     "doubao-seed-2.0-code": "ark",
     "glm-5.1": "ark",
     "kimi-k2.6": "ark",
-    "deepseek-v4-flash": "ark",
-    "deepseek-v4-pro": "ark",
     "MiniMax-M2.7-highspeed": "minimax",
     "MiniMax-M2.7": "minimax",
     "minimax2.7-hs-1": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" },
