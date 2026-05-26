@@ -607,16 +607,17 @@ async function handleRequest(
     return;
   }
 
+  const authResult = await authenticateRequest(clientApiKey);
+  if (!authResult) {
+    sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+    return;
+  }
+
   const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
   let userInfo: { name: string; allowedModels?: string[] | null };
-  const authResult = await authenticateRequest(clientApiKey);
   if (typeof headerUser === 'string' && headerUser.trim()) {
-    userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: authResult?.allowedModels ?? null };
+    userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: authResult.allowedModels };
   } else {
-    if (!authResult) {
-      sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
-      return;
-    }
     userInfo = authResult;
   }
   const clientId = userInfo.name;
@@ -878,16 +879,17 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           return;
         }
 
+        const authResult = await authenticateRequest(clientApiKey);
+        if (!authResult) {
+          sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+          return;
+        }
+
         const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
         let userInfo: { name: string; allowedModels: string[] | null };
-        const authResult = await authenticateRequest(clientApiKey);
         if (typeof headerUser === 'string' && headerUser.trim()) {
-          userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: authResult?.allowedModels ?? null };
+          userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: authResult.allowedModels };
         } else {
-          if (!authResult) {
-            sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
-            return;
-          }
           userInfo = authResult;
         }
 
