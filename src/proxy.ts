@@ -101,7 +101,18 @@ function consumeBody(req: http.IncomingMessage): void {
   req.resume();
 }
 
-// ─── Auth ───
+// ─── Auth Cache & Helpers ───
+
+interface CacheEntry {
+  userInfo: { name: string; allowedModels: string[] | null };
+  expiresAt: number;
+}
+const authCache = new Map<string, CacheEntry>();
+
+function getAuthCacheTtlMs(): number {
+  const seconds = parseInt(process.env.WOICLAW_AUTH_CACHE_TTL_SECONDS || '60', 10);
+  return (isNaN(seconds) ? 60 : seconds) * 1000;
+}
 
 function getProxyApiKey(): string {
   return process.env.WOICLAW_PROXY_API_KEY || '';
@@ -123,40 +134,58 @@ function extractClientApiKey(req: http.IncomingMessage): string | null {
   return null;
 }
 
-async function authenticateRequest(token: string): Promise<{ name: string } | null> {
+async function authenticateRequest(token: string): Promise<{ name: string; allowedModels: string[] | null } | null> {
   if (isAuthBypassed()) {
-    return { name: 'bypass' };
+    return { name: 'bypass', allowedModels: null };
+  }
+
+  const cacheKey = token;
+  const cached = authCache.get(cacheKey);
+  if (cached) {
+    if (cached.expiresAt > Date.now()) {
+      logger.verbose('[auth] Cache hit for token');
+      return cached.userInfo;
+    } else {
+      authCache.delete(cacheKey);
+    }
   }
 
   const authHost = getAuthHost();
   const proxyKey = getProxyApiKey();
+  let userInfo: { name: string; allowedModels: string[] | null } | null = null;
 
   if (authHost) {
     logger.verbose('[auth] Trying introspect first (authHost configured)');
-    const userInfo = await fetchUserInfo(token);
-    if (userInfo) {
-      logger.verbose('[auth] Introspect succeeded, got user:', userInfo.name);
-      return userInfo;
+    const fetched = await fetchUserInfo(token);
+    if (fetched) {
+      logger.verbose('[auth] Introspect succeeded, got user:', fetched.name);
+      userInfo = fetched;
+    } else {
+      logger.verbose('[auth] Introspect failed, falling back');
     }
-    logger.verbose('[auth] Introspect failed, falling back');
   }
 
-  if (proxyKey) {
+  if (!userInfo && proxyKey) {
     if (token === proxyKey) {
-      return { name: 'local' };
+      userInfo = { name: 'local', allowedModels: null };
     }
-    return null;
+  }
+
+  if (userInfo) {
+    const ttlMs = getAuthCacheTtlMs();
+    if (ttlMs > 0) {
+      authCache.set(cacheKey, {
+        userInfo,
+        expiresAt: Date.now() + ttlMs,
+      });
+    }
+    return userInfo;
   }
 
   return null;
 }
 
-function isLikelyJwt(token: string): boolean {
-  const parts = token.split('.');
-  return parts.length === 3;
-}
-
-async function fetchUserInfo(token: string): Promise<{ name: string } | null> {
+async function fetchUserInfo(token: string): Promise<{ name: string; allowedModels: string[] | null } | null> {
   const authHost = getAuthHost();
   if (!authHost) {
     logger.error('Auth host not configured (WOICLAW_AUTH_HOST)');
@@ -216,7 +245,13 @@ async function fetchUserInfo(token: string): Promise<{ name: string } | null> {
       return null;
     }
 
-    return { name: name.trim() };
+    const allowedModels = getNestedField(body, 'data.allowed_models');
+    let parsedAllowedModels: string[] | null = null;
+    if (Array.isArray(allowedModels)) {
+      parsedAllowedModels = allowedModels.map((m: any) => String(m).trim());
+    }
+
+    return { name: name.trim(), allowedModels: parsedAllowedModels };
   } catch (err) {
     logger.error('Auth error:', err);
     return null;
@@ -573,9 +608,9 @@ async function handleRequest(
   }
 
   const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
-  let userInfo: { name: string };
+  let userInfo: { name: string; allowedModels?: string[] | null };
   if (typeof headerUser === 'string' && headerUser.trim()) {
-    userInfo = { name: decodeURIComponent(headerUser.trim()) };
+    userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: null };
   } else {
     const authResult = await authenticateRequest(clientApiKey);
     if (!authResult) {
@@ -585,6 +620,14 @@ async function handleRequest(
     userInfo = authResult;
   }
   const clientId = userInfo.name;
+
+  // ─── Model Permissions Check ───
+  if (userInfo.allowedModels !== undefined && userInfo.allowedModels !== null) {
+    if (!userInfo.allowedModels.includes(model)) {
+      sendErrorResponse(res, 403, `Model ${model} is not allowed for your account.`, 'permission_error');
+      return;
+    }
+  }
 
   // ─── Upstream resolution ───
   const resolved = resolveUpstreamFromModel(model, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
@@ -829,6 +872,25 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
       }
 
       if (method === 'GET' && pathname === '/models') {
+        const clientApiKey = extractClientApiKey(req);
+        if (!clientApiKey) {
+          sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
+          return;
+        }
+
+        const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
+        let userInfo: { name: string; allowedModels: string[] | null };
+        if (typeof headerUser === 'string' && headerUser.trim()) {
+          userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: null };
+        } else {
+          const authResult = await authenticateRequest(clientApiKey);
+          if (!authResult) {
+            sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+            return;
+          }
+          userInfo = authResult;
+        }
+
         const items: Array<{ model_id: string; model_alias: string }> = [];
         const seen = new Set<string>();
 
@@ -848,7 +910,12 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model });
         }
 
-        sendJSONResponse(res, 200, { items });
+        let filteredItems = items;
+        if (userInfo.allowedModels !== null) {
+          filteredItems = items.filter(item => userInfo.allowedModels!.includes(item.model_id));
+        }
+
+        sendJSONResponse(res, 200, { items: filteredItems });
         return;
       }
 

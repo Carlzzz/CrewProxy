@@ -24,6 +24,24 @@
         { "id": "minimax-key3", "apiKey": "sk-cp-2aFOo5BIpiyqfptxJ3gp7lWh0evRo-8LbU10PBvrt2FGPdXCSg2Ep8INmEK2i5SAEHw5JDa5kZ-OBaYVwH8PITOqMx1C8xqWF0MZfSDhvUfLdfbNYg7Rm7Y", "weight": 1, "enabled": true },
         { "id": "minimax-key4", "apiKey": "sk-cp-pXHf6Ge5terTsh7bJnEc16t6hGpo5C-giuAcHqprwKVfeuFoNOSKycJfGAkVrgvlXTry5Z0Hxf9m5cIlPruwhvFMZuiIypHSGDIWbFz1bVywOC0HuSgW8Ms", "weight": 1, "enabled": true }
       ]
+    },
+    "deepseek": {
+      "baseURL": "https://api.deepseek.com/anthropic",
+      "apiKey": "sk-376edfd81a9b41a3af7895fce77383d4",
+      "model": "deepseek-v4-pro",
+      "provider": "deepseek"
+    },
+    "gpt": {
+      "baseURL": "https://xingwan.store",
+      "apiKey": "sk-rXTE4867NDX0A14sJPDMxQVjN2HcsD3WR3gaXJLRWPqamMG0",
+      "model": "gpt-5.5",
+      "provider": "gpt"
+    },
+    "claude": {
+      "baseURL": "https://xingwan.store",
+      "apiKey": "sk-RnS464j6C1QlmyKDZczHMqWrNtAYtVlauqoO5FTeTqolD4KI",
+      "model": "claude-opus-4-6-thinking",
+      "provider": "claude"
     }
   },
   "modelRoutes": {
@@ -34,6 +52,10 @@
     "MiniMax-M2.7-highspeed": "minimax",
     "MiniMax-M2.7": "minimax",
     "minimax2.7-hs-1": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" },
-    "minimax2.7-hs-2": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" }
+    "minimax2.7-hs-2": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" },
+    "deepseek-v4-pro": "deepseek",
+    "gpt-5.5": "gpt",
+    "claude-opus-4-6-thinking": "claude",
+    "claude-sonnet-4-6-thinking": { "upstream": "claude", "model": "claude-sonnet-4-6-thinking" }
   }
 }

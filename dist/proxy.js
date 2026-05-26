@@ -117,7 +117,11 @@ function readRequestBody(req) {
 function consumeBody(req) {
     req.resume();
 }
-// ─── Auth ───
+const authCache = new Map();
+function getAuthCacheTtlMs() {
+    const seconds = parseInt(process.env.WOICLAW_AUTH_CACHE_TTL_SECONDS || '60', 10);
+    return (isNaN(seconds) ? 60 : seconds) * 1000;
+}
 function getProxyApiKey() {
     return process.env.WOICLAW_PROXY_API_KEY || '';
 }
@@ -138,30 +142,49 @@ function extractClientApiKey(req) {
 }
 async function authenticateRequest(token) {
     if (isAuthBypassed()) {
-        return { name: 'bypass' };
+        return { name: 'bypass', allowedModels: null };
+    }
+    const cacheKey = token;
+    const cached = authCache.get(cacheKey);
+    if (cached) {
+        if (cached.expiresAt > Date.now()) {
+            logger_1.logger.verbose('[auth] Cache hit for token');
+            return cached.userInfo;
+        }
+        else {
+            authCache.delete(cacheKey);
+        }
     }
     const authHost = getAuthHost();
     const proxyKey = getProxyApiKey();
+    let userInfo = null;
     if (authHost) {
         logger_1.logger.verbose('[auth] Trying introspect first (authHost configured)');
-        const userInfo = await fetchUserInfo(token);
-        if (userInfo) {
-            logger_1.logger.verbose('[auth] Introspect succeeded, got user:', userInfo.name);
-            return userInfo;
+        const fetched = await fetchUserInfo(token);
+        if (fetched) {
+            logger_1.logger.verbose('[auth] Introspect succeeded, got user:', fetched.name);
+            userInfo = fetched;
         }
-        logger_1.logger.verbose('[auth] Introspect failed, falling back');
+        else {
+            logger_1.logger.verbose('[auth] Introspect failed, falling back');
+        }
     }
-    if (proxyKey) {
+    if (!userInfo && proxyKey) {
         if (token === proxyKey) {
-            return { name: 'local' };
+            userInfo = { name: 'local', allowedModels: null };
         }
-        return null;
+    }
+    if (userInfo) {
+        const ttlMs = getAuthCacheTtlMs();
+        if (ttlMs > 0) {
+            authCache.set(cacheKey, {
+                userInfo,
+                expiresAt: Date.now() + ttlMs,
+            });
+        }
+        return userInfo;
     }
     return null;
-}
-function isLikelyJwt(token) {
-    const parts = token.split('.');
-    return parts.length === 3;
 }
 async function fetchUserInfo(token) {
     const authHost = getAuthHost();
@@ -219,7 +242,12 @@ async function fetchUserInfo(token) {
             logger_1.logger.verbose(`Auth failed: name field "${nameField}" is empty or missing`);
             return null;
         }
-        return { name: name.trim() };
+        const allowedModels = getNestedField(body, 'data.allowed_models');
+        let parsedAllowedModels = null;
+        if (Array.isArray(allowedModels)) {
+            parsedAllowedModels = allowedModels.map((m) => String(m).trim());
+        }
+        return { name: name.trim(), allowedModels: parsedAllowedModels };
     }
     catch (err) {
         logger_1.logger.error('Auth error:', err);
@@ -549,7 +577,7 @@ async function handleRequest(req, res, ctx) {
     const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
     let userInfo;
     if (typeof headerUser === 'string' && headerUser.trim()) {
-        userInfo = { name: decodeURIComponent(headerUser.trim()) };
+        userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: null };
     }
     else {
         const authResult = await authenticateRequest(clientApiKey);
@@ -560,6 +588,13 @@ async function handleRequest(req, res, ctx) {
         userInfo = authResult;
     }
     const clientId = userInfo.name;
+    // ─── Model Permissions Check ───
+    if (userInfo.allowedModels !== undefined && userInfo.allowedModels !== null) {
+        if (!userInfo.allowedModels.includes(model)) {
+            sendErrorResponse(res, 403, `Model ${model} is not allowed for your account.`, 'permission_error');
+            return;
+        }
+    }
     // ─── Upstream resolution ───
     const resolved = (0, config_1.resolveUpstreamFromModel)(model, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
     if (!resolved) {
@@ -787,6 +822,24 @@ function createProxyServer(ctx) {
                 return;
             }
             if (method === 'GET' && pathname === '/models') {
+                const clientApiKey = extractClientApiKey(req);
+                if (!clientApiKey) {
+                    sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
+                    return;
+                }
+                const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
+                let userInfo;
+                if (typeof headerUser === 'string' && headerUser.trim()) {
+                    userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: null };
+                }
+                else {
+                    const authResult = await authenticateRequest(clientApiKey);
+                    if (!authResult) {
+                        sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+                        return;
+                    }
+                    userInfo = authResult;
+                }
                 const items = [];
                 const seen = new Set();
                 for (const [modelName] of ctx.modelRoutesMap) {
@@ -804,7 +857,11 @@ function createProxyServer(ctx) {
                 if (ctx.defaultUpstream && !seen.has(ctx.defaultUpstream.model)) {
                     items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model });
                 }
-                sendJSONResponse(res, 200, { items });
+                let filteredItems = items;
+                if (userInfo.allowedModels !== null) {
+                    filteredItems = items.filter(item => userInfo.allowedModels.includes(item.model_id));
+                }
+                sendJSONResponse(res, 200, { items: filteredItems });
                 return;
             }
             if (method === 'POST' && pathname === '/v1/messages/count_tokens') {
