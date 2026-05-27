@@ -54,6 +54,7 @@
     "minimax2.7-hs-1": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" },
     "minimax2.7-hs-2": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" },
     "deepseek-v4-pro": "deepseek",
+    "deepseek-v4-flash": "deepseek",
     "gpt-5.5": "gpt",
     "claude-opus-4-6-thinking": "claude",
     "claude-sonnet-4-6-thinking": { "upstream": "claude", "model": "claude-sonnet-4-6-thinking" }
