@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($file = \"c:\\\\Users\\\\zhaocao\\\\Documents\\\\GitHub\\\\CrewProxy\\\\src\\\\contextBudget.ts\"; $lines = Get-Content $file; $lines = $lines | Where-Object { $_ -notmatch 'CJK_RANGES' }; $lines | Set-Content $file -Encoding utf8)"
+    ]
+  }
+}

@@ -1,6 +1,6 @@
-import { logger } from './logger';
+﻿import { logger } from './logger';
 
-// ─── Model context window registry ──────────────────────────────────────────
+// 鈹€鈹€鈹€ Model context window registry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 interface ModelContextSpec {
   pattern: RegExp;
@@ -57,14 +57,20 @@ export function getModelContextWindow(modelId: string): { contextWindow: number;
   return { contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutputTokens: DEFAULT_MAX_OUTPUT };
 }
 
-// ─── Token estimation (Anthropic format) ────────────────────────────────────
+// 鈹€鈹€鈹€ Token estimation (Anthropic format) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-const CJK_RANGES = /[一-鿿㐀-䶿豈-﫿]/g;
 
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
-  const cjkMatches = text.match(CJK_RANGES);
-  const cjkCount = cjkMatches ? cjkMatches.length : 0;
+  let cjkCount = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if ((code >= 0x4E00 && code <= 0x9FFF) ||
+        (code >= 0x3400 && code <= 0x4DBF) ||
+        (code >= 0xF900 && code <= 0xFAFF)) {
+      cjkCount++;
+    }
+  }
   const nonCjkCount = text.length - cjkCount;
   const raw = Math.ceil(nonCjkCount / 4) + Math.ceil(cjkCount / 1.5);
   return Math.ceil(raw * 1.05);
@@ -134,7 +140,7 @@ export function estimateRequestTokens(body: any): number {
   return total;
 }
 
-// ─── Budget calculation ─────────────────────────────────────────────────────
+// 鈹€鈹€鈹€ Budget calculation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 export function computeInputBudget(modelId: string, requestedMaxOutput?: number): number {
   const spec = getModelContextWindow(modelId);
@@ -143,7 +149,7 @@ export function computeInputBudget(modelId: string, requestedMaxOutput?: number)
   return Math.max(budget, 1024);
 }
 
-// ─── Trimming (Anthropic format) ────────────────────────────────────────────
+// 鈹€鈹€鈹€ Trimming (Anthropic format) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 export interface TrimResult {
   trimmed: boolean;
@@ -202,15 +208,19 @@ function findProtectedTailIndex(messages: any[]): number {
   return protectFrom;
 }
 
+function estimateMessageTokens(msg: any): number {
+  return 4 + estimateAnthropicContent(msg.content);
+}
+
 export function trimToFitBudget(body: any, inputBudget: number): TrimResult {
-  const trimmed = JSON.parse(JSON.stringify(body));
+  const trimmed = structuredClone(body);
   const actions: string[] = [];
   const messages: any[] = trimmed.messages || [];
   if (!messages.length) {
     return { trimmed: false, trimmedBody: trimmed, estimatedTokens: estimateRequestTokens(trimmed), actions };
   }
 
-  const check = () => estimateRequestTokens(trimmed);
+  let currentEstimate = estimateRequestTokens(trimmed);
 
   // Phase 1: remove images from old messages (keep last 2 user messages' images)
   let userWithImageCount = 0;
@@ -223,13 +233,16 @@ export function trimToFitBudget(body: any, inputBudget: number): TrimResult {
       if (messages[i].role === 'user' && hasImageInContent(messages[i].content)) {
         kept++;
         if (kept > 2) {
+          const before = estimateAnthropicContent(messages[i].content);
           replaceImagesWithPlaceholderInContent(messages[i].content);
+          const after = estimateAnthropicContent(messages[i].content);
+          currentEstimate -= (before - after);
           actions.push(`removed images from message[${i}]`);
         }
       }
     }
-    if (check() <= inputBudget) {
-      return { trimmed: true, trimmedBody: trimmed, estimatedTokens: check(), actions };
+    if (currentEstimate <= inputBudget) {
+      return { trimmed: true, trimmedBody: trimmed, estimatedTokens: currentEstimate, actions };
     }
   }
 
@@ -237,67 +250,71 @@ export function trimToFitBudget(body: any, inputBudget: number): TrimResult {
   let removedAnyImage = false;
   for (let i = 0; i < messages.length; i++) {
     if (hasImageInContent(messages[i].content)) {
+      const before = estimateAnthropicContent(messages[i].content);
       replaceImagesWithPlaceholderInContent(messages[i].content);
+      const after = estimateAnthropicContent(messages[i].content);
+      currentEstimate -= (before - after);
       actions.push(`removed all images from message[${i}]`);
       removedAnyImage = true;
     }
   }
-  // Also check system for images
   if (Array.isArray(trimmed.system)) {
     for (let i = 0; i < trimmed.system.length; i++) {
       if (trimmed.system[i].type === 'image') {
+        const before = estimateAnthropicContent([trimmed.system[i]]);
         trimmed.system[i] = { type: 'text', text: '[image removed to fit context]' };
+        const after = estimateAnthropicContent([trimmed.system[i]]);
+        currentEstimate -= (before - after);
         removedAnyImage = true;
       }
     }
   }
-  if (removedAnyImage && check() <= inputBudget) {
-    return { trimmed: true, trimmedBody: trimmed, estimatedTokens: check(), actions };
+  if (removedAnyImage && currentEstimate <= inputBudget) {
+    return { trimmed: true, trimmedBody: trimmed, estimatedTokens: currentEstimate, actions };
   }
 
   // Phase 3: remove oldest messages (preserve protected tail)
   let protectFrom = findProtectedTailIndex(messages);
   let idx = 0;
   let removedCount = 0;
-  while (idx < protectFrom && check() > inputBudget) {
+  while (idx < protectFrom && currentEstimate > inputBudget) {
     const msg = messages[idx];
+    const msgTokens = estimateMessageTokens(msg);
     const toolUseIds = findToolUseIdsInMessage(msg);
     const toolResultIds = findToolResultIdsInMessage(msg);
 
-    // Remove the current message
     messages.splice(idx, 1);
+    currentEstimate -= msgTokens;
     removedCount++;
 
-    // If assistant with tool_use, also remove the next user message with matching tool_result
     if (toolUseIds.size > 0 && idx < messages.length && messages[idx].role === 'user') {
       const nextResultIds = findToolResultIdsInMessage(messages[idx]);
       const allMatch = [...nextResultIds].every(id => toolUseIds.has(id));
       if (allMatch && nextResultIds.size > 0) {
+        currentEstimate -= estimateMessageTokens(messages[idx]);
         messages.splice(idx, 1);
         removedCount++;
       }
-    }
-    // If user with tool_result, also remove the preceding assistant with matching tool_use
-    else if (toolResultIds.size > 0 && idx > 0 && messages[idx - 1].role === 'assistant') {
+    } else if (toolResultIds.size > 0 && idx > 0 && messages[idx - 1].role === 'assistant') {
       const prevUseIds = findToolUseIdsInMessage(messages[idx - 1]);
       const allMatch = [...prevUseIds].every(id => toolResultIds.has(id));
       if (allMatch && prevUseIds.size > 0) {
+        currentEstimate -= estimateMessageTokens(messages[idx - 1]);
         messages.splice(idx - 1, 1);
         removedCount++;
-        idx--; // step back since we removed the preceding message
+        idx--;
       }
     }
 
-    // Recalculate protectFrom since indices shifted
     protectFrom = findProtectedTailIndex(messages);
   }
   if (removedCount > 0) actions.push(`removed ${removedCount} oldest messages`);
-  if (check() <= inputBudget) {
-    return { trimmed: true, trimmedBody: trimmed, estimatedTokens: check(), actions };
+  if (currentEstimate <= inputBudget) {
+    return { trimmed: true, trimmedBody: trimmed, estimatedTokens: currentEstimate, actions };
   }
 
   // Phase 4: truncate longest text content to 50%
-  for (let pass = 0; pass < 3 && check() > inputBudget; pass++) {
+  for (let pass = 0; pass < 3 && currentEstimate > inputBudget; pass++) {
     let maxLen = 0;
     let maxMsgIdx = -1;
     let maxBlockIdx = -1;
@@ -337,8 +354,10 @@ export function trimToFitBudget(body: any, inputBudget: number): TrimResult {
 
     if (maxMsgIdx < 0 && maxMsgIdx !== -2) break;
 
+    const halfLen = Math.ceil(maxLen / 2);
+    const savedTokens = Math.floor((maxLen - halfLen - 15) / 4);
+
     if (maxMsgIdx === -2) {
-      // Truncate system
       if (maxBlockIdx >= 0) {
         trimmed.system[maxBlockIdx].text =
           trimmed.system[maxBlockIdx].text.slice(0, Math.ceil(maxLen / 2)) + '\n[...truncated]';
@@ -356,12 +375,13 @@ export function trimToFitBudget(body: any, inputBudget: number): TrimResult {
         (messages[maxMsgIdx].content as string).slice(0, Math.ceil(maxLen / 2)) + '\n[...truncated]';
       actions.push(`truncated long text in message[${maxMsgIdx}]`);
     }
+    currentEstimate -= Math.max(0, savedTokens);
   }
 
-  return { trimmed: actions.length > 0, trimmedBody: trimmed, estimatedTokens: check(), actions };
+  return { trimmed: actions.length > 0, trimmedBody: trimmed, estimatedTokens: currentEstimate, actions };
 }
 
-// ─── 400 error detection ────────────────────────────────────────────────────
+// 鈹€鈹€鈹€ 400 error detection 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 const TOKEN_EXCEED_PATTERNS = [
   /total\s+tokens?.*exceed/i,
@@ -380,10 +400,10 @@ export function isTokenExceedError(status: number, bodyText: string): boolean {
   return TOKEN_EXCEED_PATTERNS.some(p => p.test(bodyText));
 }
 
-// ─── Aggressive trim for retry (Anthropic format) ───────────────────────────
+// 鈹€鈹€鈹€ Aggressive trim for retry (Anthropic format) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 export function aggressiveTrimForRetry(body: any, round: number = 0): any {
-  const trimmed = JSON.parse(JSON.stringify(body));
+  const trimmed = structuredClone(body);
   const messages: any[] = trimmed.messages || [];
 
   // Replace images in all message content
@@ -442,7 +462,7 @@ export function aggressiveTrimForRetry(body: any, round: number = 0): any {
     }
   }
 
-  // Truncate tool_result content blocks — more aggressively on later rounds
+  // Truncate tool_result content blocks 鈥?more aggressively on later rounds
   const toolMaxLen = round === 0 ? 2000 : round === 1 ? 500 : 200;
   for (const msg of messages) {
     if (Array.isArray(msg.content)) {

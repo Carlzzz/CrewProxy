@@ -103,11 +103,21 @@ function consumeBody(req: http.IncomingMessage): void {
 
 // ─── Auth Cache & Helpers ───
 
+const AUTH_CACHE_MAX_SIZE = 1000;
+
 interface CacheEntry {
   userInfo: { name: string; allowedModels: string[] | null };
   expiresAt: number;
 }
 const authCache = new Map<string, CacheEntry>();
+
+function authCacheSet(key: string, entry: CacheEntry): void {
+  if (authCache.size >= AUTH_CACHE_MAX_SIZE) {
+    const firstKey = authCache.keys().next().value;
+    if (firstKey !== undefined) authCache.delete(firstKey);
+  }
+  authCache.set(key, entry);
+}
 
 function getAuthCacheTtlMs(): number {
   const seconds = parseInt(process.env.WOICLAW_AUTH_CACHE_TTL_SECONDS || '60', 10);
@@ -174,7 +184,7 @@ async function authenticateRequest(token: string): Promise<{ name: string; allow
   if (userInfo) {
     const ttlMs = getAuthCacheTtlMs();
     if (ttlMs > 0) {
-      authCache.set(cacheKey, {
+      authCacheSet(cacheKey, {
         userInfo,
         expiresAt: Date.now() + ttlMs,
       });
@@ -465,17 +475,27 @@ async function handleAnthropicStreamResponse(
 
   const reader = body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '';
+  const bufferChunks: string[] = [];
+  let bufferStr = '';
   const abortSignal = { aborted: false };
 
   const onClose = () => { abortSignal.aborted = true; };
   req.once('close', onClose);
   res.once('close', onClose);
 
+  const getBuffer = (): string => {
+    if (bufferChunks.length > 0) {
+      bufferStr += bufferChunks.join('');
+      bufferChunks.length = 0;
+    }
+    return bufferStr;
+  };
+
   const processBuffer = (): void => {
+    let buf = getBuffer();
     let popped: { packet: string; rest: string } | null;
-    while ((popped = popSSEPacket(buffer))) {
-      buffer = popped.rest;
+    while ((popped = popSSEPacket(buf))) {
+      buf = popped.rest;
       let eventType = '';
       const dataLines: string[] = [];
       for (const l of popped.packet.split(/\r?\n/)) {
@@ -517,17 +537,18 @@ async function handleAnthropicStreamResponse(
         logger.verbose('Anthropic SSE chunk parse error:', parseErr);
       }
     }
+    bufferStr = buf;
   };
 
   try {
     while (!abortSignal.aborted) {
       const result = await readWithTimeout(reader, STREAM_READ_TIMEOUT_MS, abortSignal);
       if (result.done) {
-        buffer += decoder.decode(new Uint8Array(), { stream: false });
+        bufferChunks.push(decoder.decode(new Uint8Array(), { stream: false }));
         processBuffer();
         break;
       }
-      buffer += decoder.decode(result.value!, { stream: true });
+      bufferChunks.push(decoder.decode(result.value!, { stream: true }));
       processBuffer();
     }
   } catch (err) {
@@ -668,7 +689,7 @@ async function handleRequest(
   }
 
   // ─── Build Anthropic request (no format conversion) ───
-  const anthropicReq = JSON.parse(JSON.stringify(parsedBody));
+  const anthropicReq = structuredClone(parsedBody);
   anthropicReq.model = effectiveModel;
 
   // Auto-boost max_tokens to model maximum if not set or too low
