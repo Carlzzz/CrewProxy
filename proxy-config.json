@@ -16,7 +16,7 @@
     "minimax": {
       "baseURL": "https://api.minimaxi.com/anthropic",
       "apiKey": "sk-cp-JAuqghZ2eX7kxqJDQpqOuqXulLKDTOf72Nl4J5dlp3TKkiZCnTAhikod1gP-X8p2xzvYboyCbl7yWii1WWZY9Dnnfk-i7GFEHfoKf4YqyzfYs74GLMp6tkM",
-      "model": "MiniMax-M2.7-highspeed",
+      "model": "MiniMax-M3",
       "provider": "minimax",
       "codePlanCredentials": [
         { "id": "minimax-key1", "apiKey": "sk-cp-JAuqghZ2eX7kxqJDQpqOuqXulLKDTOf72Nl4J5dlp3TKkiZCnTAhikod1gP-X8p2xzvYboyCbl7yWii1WWZY9Dnnfk-i7GFEHfoKf4YqyzfYs74GLMp6tkM", "weight": 1, "enabled": true },
@@ -49,10 +49,7 @@
     "doubao-seed-2.0-code": "ark",
     "glm-5.1": "ark",
     "kimi-k2.6": "ark",
-    "MiniMax-M2.7-highspeed": "minimax",
-    "MiniMax-M2.7": "minimax",
-    "minimax2.7-hs-1": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" },
-    "minimax2.7-hs-2": { "upstream": "minimax", "model": "MiniMax-M2.7-highspeed" },
+    "MiniMax-M3": "minimax",
     "deepseek-v4-pro": "deepseek",
     "deepseek-v4-flash": "deepseek",
     "gpt-5.5": "gpt",
