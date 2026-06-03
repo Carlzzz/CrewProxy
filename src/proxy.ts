@@ -659,36 +659,11 @@ async function handleRequest(
   }
   const { upstream, modelId, upstreamRouteId } = resolved;
 
-  // ─── Code Plan credential selection ───
-  let effectiveApiKey = upstream.apiKey;
-  let effectiveModel = modelId || upstream.model;
-  let effectiveBaseURL = upstream.baseURL;
   const codePlanPoolKey = upstreamRouteId || '__default__';
-  let pickedCredentialId: string | null = null;
-
-  if (ctx.codePlanPool && upstream.codePlanCredentials?.length) {
-    const pick = ctx.codePlanPool.pickOrFallback(codePlanPoolKey, typeof req.headers['x-woicrew-session-id'] === 'string' ? req.headers['x-woicrew-session-id'] : undefined);
-    pickedCredentialId = pick.credentialId;
-    if (pick.credentialId !== null) {
-      effectiveApiKey = pick.apiKey;
-      if (pick.model) effectiveModel = pick.model;
-      // Prefer Anthropic-specific base URL, then generic code plan base URL
-      if (upstream.codePlanAnthropicBaseURL) effectiveBaseURL = upstream.codePlanAnthropicBaseURL;
-      else if (upstream.codePlanBaseURL) effectiveBaseURL = upstream.codePlanBaseURL;
-      logger.verbose(`[${reqId}] CodePlan pick: ${pick.credentialId} -> effectiveModel: ${effectiveModel}`);
-    } else {
-      logger.verbose(`[${reqId}] CodePlan: no available credential, using ordinary key`);
-      if (upstream.ordinaryFallbackModelMap) {
-        const mapped = upstream.ordinaryFallbackModelMap[effectiveModel];
-        if (mapped) {
-          effectiveModel = mapped;
-          logger.verbose(`[${reqId}] CodePlan ordinary fallback model remap: ${modelId || upstream.model} -> ${mapped}`);
-        }
-      }
-    }
-  }
+  const hasCodePlan = !!(ctx.codePlanPool && upstream.codePlanCredentials?.length);
 
   // ─── Build Anthropic request (no format conversion) ───
+  let effectiveModel = modelId || upstream.model;
   const anthropicReq = structuredClone(parsedBody);
   anthropicReq.model = effectiveModel;
 
@@ -736,7 +711,8 @@ async function handleRequest(
     }
   }
 
-  const targetURLs = buildAnthropicMessagesURL(effectiveBaseURL);
+  // Save a pristine copy of the request body so we can reset after failed attempts
+  const pristineRequestBody = structuredClone(upstreamRequestBody);
 
   const usageExtra: Partial<UsageLogExtra> = {
     app: 'woicrew',
@@ -744,7 +720,7 @@ async function handleRequest(
     stream: parsedBody.stream === true,
     request_size: rawBody.length,
     session_id: typeof req.headers['x-woicrew-session-id'] === 'string' && req.headers['x-woicrew-session-id'] ? req.headers['x-woicrew-session-id'] as string : null,
-    routing_key: pickedCredentialId ?? upstreamRouteId ?? '__default__',
+    routing_key: upstreamRouteId ?? '__default__',
   };
 
   const USAGE_LOG_INPUT_FULLTEXT = process.env.WOICLAW_USAGE_LOG_INPUT_FULLTEXT;
@@ -752,98 +728,203 @@ async function handleRequest(
     usageExtra.input_fulltext = JSON.stringify(upstreamRequestBody);
   }
 
-  // ─── Build upstream request headers ───
-  const upstreamHeaders: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'x-api-key': effectiveApiKey,
-    'Authorization': `Bearer ${effectiveApiKey}`,
-  };
-  // Forward Anthropic-specific headers from client
-  for (const hdr of ['anthropic-version', 'anthropic-beta']) {
-    const val = req.headers[hdr];
-    if (typeof val === 'string') {
-      upstreamHeaders[hdr] = val;
-    }
-  }
-
+  // ─── Code Plan credential retry loop ───
+  // Each iteration picks a fresh credential from the pool (skipping cooldowns).
+  // On network error / 429 / 5xx: mark cooldown, retry with next credential.
+  // On 4xx client errors (non-429): return immediately — retrying won't help.
+  // On 400 token errors: try trim first, then switch credential if still failing.
   let upstreamResponse: Response | null = null;
   let lastError: any = null;
+  let pickedCredentialId: string | null = null;
+  let effectiveApiKey = upstream.apiKey;
+  let effectiveBaseURL = upstream.baseURL;
+  const maxCredAttempts = hasCodePlan ? ((upstream.codePlanCredentials?.length ?? 0) + 1) : 1;
+  let usedOrdinaryFallback = false;
 
-  for (const targetURL of targetURLs) {
-    logger.verbose(`[${reqId}] Fetching: ${targetURL}`);
-    try {
-      upstreamResponse = await fetch(targetURL, {
-        method: 'POST',
-        headers: upstreamHeaders,
-        body: JSON.stringify(upstreamRequestBody),
-      });
+  for (let credAttempt = 0; credAttempt < maxCredAttempts; credAttempt++) {
+    // ── Select credential ──
+    if (hasCodePlan) {
+      const pick = ctx.codePlanPool!.pickOrFallback(
+        codePlanPoolKey,
+        typeof req.headers['x-woicrew-session-id'] === 'string' ? req.headers['x-woicrew-session-id'] : undefined
+      );
+      pickedCredentialId = pick.credentialId;
 
-      if (upstreamResponse.status === 404 && targetURLs.indexOf(targetURL) < targetURLs.length - 1) {
-        logger.verbose(`[${reqId}] 404 from ${targetURL}, trying next URL`);
-        upstreamResponse = null;
+      if (pick.credentialId !== null) {
+        effectiveApiKey = pick.apiKey;
+        effectiveModel = pick.model ?? (modelId || upstream.model);
+        if (upstream.codePlanAnthropicBaseURL) effectiveBaseURL = upstream.codePlanAnthropicBaseURL;
+        else if (upstream.codePlanBaseURL) effectiveBaseURL = upstream.codePlanBaseURL;
+        else effectiveBaseURL = upstream.baseURL;
+        usedOrdinaryFallback = false;
+        logger.verbose(`[${reqId}] CodePlan pick: ${pick.credentialId} (attempt=${credAttempt}) -> model: ${effectiveModel}`);
+      } else {
+        // All code plan credentials exhausted — fallback to ordinary key
+        effectiveApiKey = upstream.apiKey;
+        effectiveBaseURL = upstream.baseURL;
+        effectiveModel = modelId || upstream.model;
+        usedOrdinaryFallback = true;
+        pickedCredentialId = null;
+        logger.verbose(`[${reqId}] CodePlan: all credentials exhausted, falling back to ordinary key`);
+        if (upstream.ordinaryFallbackModelMap) {
+          const mapped = upstream.ordinaryFallbackModelMap[effectiveModel];
+          if (mapped) {
+            effectiveModel = mapped;
+            logger.verbose(`[${reqId}] CodePlan ordinary fallback model remap: ${modelId || upstream.model} -> ${mapped}`);
+          }
+        }
+      }
+    }
+
+    // Update model in request body for this credential
+    upstreamRequestBody.model = effectiveModel;
+
+    // ── Build headers for this credential ──
+    const upstreamHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'x-api-key': effectiveApiKey,
+      'Authorization': `Bearer ${effectiveApiKey}`,
+    };
+    for (const hdr of ['anthropic-version', 'anthropic-beta']) {
+      const val = req.headers[hdr];
+      if (typeof val === 'string') {
+        upstreamHeaders[hdr] = val;
+      }
+    }
+
+    // ── Build target URLs from current effective base URL ──
+    const targetURLs = buildAnthropicMessagesURL(effectiveBaseURL);
+
+    // ── Try all target URLs for this credential ──
+    for (const targetURL of targetURLs) {
+      logger.verbose(`[${reqId}] Fetching: ${targetURL}`);
+      try {
+        upstreamResponse = await fetch(targetURL, {
+          method: 'POST',
+          headers: upstreamHeaders,
+          body: JSON.stringify(upstreamRequestBody),
+        });
+
+        if (upstreamResponse.status === 404 && targetURLs.indexOf(targetURL) < targetURLs.length - 1) {
+          logger.verbose(`[${reqId}] 404 from ${targetURL}, trying next URL`);
+          upstreamResponse = null;
+          continue;
+        }
+        break;
+      } catch (fetchErr) {
+        lastError = fetchErr;
+        logger.error(`[${reqId}] Fetch error:`, fetchErr);
+      }
+    }
+
+    // ── Success ──
+    if (upstreamResponse && upstreamResponse.ok) {
+      logger.verbose(`[${reqId}] CodePlan success with credential=${pickedCredentialId} (attempt=${credAttempt})`);
+      break;
+    }
+
+    // ── Network error (no response) — mark cooldown and retry ──
+    if (!upstreamResponse) {
+      if (pickedCredentialId !== null && !usedOrdinaryFallback) {
+        ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, CODE_PLAN_COOLDOWN_MS);
+        logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId} after network error, retrying with next credential`);
+        upstreamRequestBody = structuredClone(pristineRequestBody);
         continue;
       }
+      // Ordinary key failed with network error — no more fallbacks
       break;
-    } catch (fetchErr) {
-      lastError = fetchErr;
-      logger.error(`[${reqId}] Fetch error:`, fetchErr);
     }
+
+    // ── Non-ok response ──
+    let errText = '';
+    try { errText = await upstreamResponse.clone().text(); } catch {}
+    logger.verbose(`[${reqId}] Upstream error ${upstreamResponse.status}:`, errText.substring(0, 500));
+
+    // ── Token trimming (per credential attempt) ──
+    if (upstreamResponse.status === 400 && !usedOrdinaryFallback) {
+      // Try clamping max_tokens if the error suggests a limit
+      if (clampMaxTokensFromAnthropicError(errText, upstreamRequestBody)) {
+        const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
+          method: 'POST',
+          headers: upstreamHeaders,
+          body: JSON.stringify(upstreamRequestBody),
+        });
+        if (retryResp.ok || retryResp.status !== 400) {
+          upstreamResponse = retryResp;
+          logger.verbose(`[${reqId}] CodePlan success after max_tokens clamp (attempt=${credAttempt})`);
+          break;
+        }
+      }
+
+      // Token-exceed retry loop
+      for (let trimRound = 0; trimRound < 3; trimRound++) {
+        if (upstreamResponse && upstreamResponse.ok) break;
+        if (!isTokenExceedError(upstreamResponse.status, errText)) break;
+
+        upstreamRequestBody = aggressiveTrimForRetry(upstreamRequestBody, trimRound);
+        logger.verbose(`[${reqId}] Token exceed error, retry round ${trimRound + 1}/3 with aggressively trimmed context`);
+        const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
+          method: 'POST',
+          headers: upstreamHeaders,
+          body: JSON.stringify(upstreamRequestBody),
+        });
+        upstreamResponse = retryResp;
+        if (!upstreamResponse.ok) {
+          try { errText = await upstreamResponse.clone().text(); } catch {}
+        }
+      }
+      if (upstreamResponse && upstreamResponse.ok) {
+        logger.verbose(`[${reqId}] CodePlan success after token trim (attempt=${credAttempt})`);
+        break;
+      }
+    }
+
+    // ── Mark credential cooldown on failure ──
+    if (pickedCredentialId !== null && !usedOrdinaryFallback) {
+      let cooldownMs = CODE_PLAN_COOLDOWN_MS;
+      if (isQuotaLimitedResponse(upstreamResponse.status, errText)) {
+        const resetMs = parseQuotaResetEpochMs(errText);
+        if (resetMs) cooldownMs = Math.max(resetMs - Date.now(), CODE_PLAN_COOLDOWN_MS);
+      }
+      ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs);
+      logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId}: ${cooldownMs}ms`);
+    }
+
+    // ── Decide whether to retry with next credential ──
+    // 4xx client errors (non-429, non-400) are not retryable
+    if (upstreamResponse.status >= 400 && upstreamResponse.status < 500 &&
+        upstreamResponse.status !== 429 && upstreamResponse.status !== 400) {
+      logger.verbose(`[${reqId}] Non-retryable client error ${upstreamResponse.status}, not switching credential`);
+      break;
+    }
+
+    // Ordinary key failed — no more fallbacks
+    if (usedOrdinaryFallback) {
+      logger.verbose(`[${reqId}] Ordinary fallback failed with status ${upstreamResponse.status}, giving up`);
+      break;
+    }
+
+    // Reset request body and retry with next credential
+    logger.verbose(`[${reqId}] Retrying with next credential (attempt=${credAttempt})`);
+    upstreamRequestBody = structuredClone(pristineRequestBody);
+    upstreamResponse = null;
   }
 
+  // Update usage extra with the final credential that was used
+  usageExtra.routing_key = pickedCredentialId ?? upstreamRouteId ?? '__default__';
+
+  // ── Final error check ──
   if (!upstreamResponse) {
     sendErrorResponse(res, 502, `Upstream request failed: ${lastError?.message || 'unknown'}`, 'api_error');
     return;
   }
 
-  // ─── Error retry logic ───
-  if (!upstreamResponse.ok) {
-    let bodyText = '';
-    try { bodyText = await upstreamResponse.clone().text(); } catch {}
-
-    // Try clamping max_tokens if the error suggests a limit
-    if (upstreamResponse.status === 400 && clampMaxTokensFromAnthropicError(bodyText, upstreamRequestBody)) {
-      const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
-        method: 'POST',
-        headers: upstreamHeaders,
-        body: JSON.stringify(upstreamRequestBody),
-      });
-      if (retryResp.ok || retryResp.status !== 400) upstreamResponse = retryResp;
-    }
-
-    // Token-exceed retry loop
-    for (let trimRound = 0; trimRound < 3; trimRound++) {
-      if (upstreamResponse.ok || upstreamResponse.status !== 400) break;
-      try { bodyText = await upstreamResponse.clone().text(); } catch {}
-      if (!isTokenExceedError(upstreamResponse.status, bodyText)) break;
-
-      upstreamRequestBody = aggressiveTrimForRetry(upstreamRequestBody, trimRound);
-      logger.verbose(`[${reqId}] Token exceed error, retry round ${trimRound + 1}/3 with aggressively trimmed context`);
-      const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
-        method: 'POST',
-        headers: upstreamHeaders,
-        body: JSON.stringify(upstreamRequestBody),
-      });
-      upstreamResponse = retryResp;
-    }
-  }
-
   if (!upstreamResponse.ok) {
     let errText = '';
     try { errText = await upstreamResponse.clone().text(); } catch {}
-    logger.verbose(`[${reqId}] Upstream error ${upstreamResponse.status}:`, errText.substring(0, 500));
-
-    // Code Plan cooldown: if 429 quota exceeded, mark credential in cooldown
-    if (pickedCredentialId !== null && isQuotaLimitedResponse(upstreamResponse.status, errText)) {
-      const resetMs = parseQuotaResetEpochMs(errText);
-      const cooldownMs = resetMs ? Math.max(resetMs - Date.now(), CODE_PLAN_COOLDOWN_MS) : CODE_PLAN_COOLDOWN_MS;
-      ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs);
-      logger.verbose(`[${reqId}] CodePlan cooldown triggered for ${pickedCredentialId}: ${cooldownMs}ms`);
-    }
-
     sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
     return;
   }
-
   if (parsedBody.stream) {
     await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra);
     return;
