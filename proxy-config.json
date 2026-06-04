@@ -40,7 +40,7 @@
     "claude": {
       "baseURL": "https://xingwan.store",
       "apiKey": "sk-RnS464j6C1QlmyKDZczHMqWrNtAYtVlauqoO5FTeTqolD4KI",
-      "model": "claude-opus-4-6-thinking",
+      "model": "claude-opus-4-8",
       "provider": "claude"
     }
   },
@@ -53,7 +53,7 @@
     "deepseek-v4-pro": "deepseek",
     "deepseek-v4-flash": "deepseek",
     "gpt-5.5": "gpt",
-    "claude-opus-4-6-thinking": "claude",
-    "claude-sonnet-4-6-thinking": { "upstream": "claude", "model": "claude-sonnet-4-6-thinking" }
+    "claude-opus-4-8": "claude",
+    "claude-sonnet-4-6": { "upstream": "claude", "model": "claude-sonnet-4-6" }
   }
 }
