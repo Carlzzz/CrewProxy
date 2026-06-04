@@ -511,12 +511,14 @@ async function handleAnthropicStreamResponse(
         // Extract usage from message_start and message_delta events for logging
         if (eventType === 'message_start' && data.message?.usage) {
           const u = data.message.usage;
-          state.inputTokens = Math.max(state.inputTokens, u.input_tokens ?? 0);
-          state.outputTokens = Math.max(state.outputTokens, u.output_tokens ?? 0);
+          // Some providers (e.g. MiniMax M3) use OpenAI-compat field names
+          // (prompt_tokens / completion_tokens) instead of Anthropic names
+          state.inputTokens = Math.max(state.inputTokens, u.input_tokens ?? u.prompt_tokens ?? 0);
+          state.outputTokens = Math.max(state.outputTokens, u.output_tokens ?? u.completion_tokens ?? 0);
           state.cachedInputTokens = Math.max(state.cachedInputTokens, extractCachedInputTokensFromUsage(u));
         }
         if (eventType === 'message_delta' && data.usage) {
-          state.outputTokens = Math.max(state.outputTokens, data.usage.output_tokens ?? 0);
+          state.outputTokens = Math.max(state.outputTokens, data.usage.output_tokens ?? data.usage.completion_tokens ?? 0);
         }
         if (eventType === 'message_stop') {
           state.sawMessageStop = true;
@@ -942,8 +944,11 @@ async function handleRequest(
   const inputContent = buildTrimmedInputContentForUsageLog(upstreamRequestBody);
   const outputContent = extractOutputContentFromAnthropicResponse(anthropicResp);
   const respUsage = anthropicResp.usage || { input_tokens: 0, output_tokens: 0 };
+  // Some providers use OpenAI-compat field names (prompt_tokens / completion_tokens)
+  const inputTokens = respUsage.input_tokens ?? respUsage.prompt_tokens ?? 0;
+  const outputTokens = respUsage.output_tokens ?? respUsage.completion_tokens ?? 0;
 
-  appendUsageLog(clientId, effectiveModel, startTime, respUsage.input_tokens || 0, respUsage.output_tokens || 0, {
+  appendUsageLog(clientId, effectiveModel, startTime, inputTokens, outputTokens, {
     ...usageExtra,
     input_cached_token: extractCachedInputTokensFromUsage(anthropicResp.usage),
     input_content: inputContent,
