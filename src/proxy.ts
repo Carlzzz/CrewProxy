@@ -518,6 +518,8 @@ async function handleAnthropicStreamResponse(
           state.cachedInputTokens = Math.max(state.cachedInputTokens, extractCachedInputTokensFromUsage(u));
         }
         if (eventType === 'message_delta' && data.usage) {
+          // MiniMax M3 reports real input_tokens in message_delta, not in message_start
+          state.inputTokens = Math.max(state.inputTokens, data.usage.input_tokens ?? data.usage.prompt_tokens ?? 0);
           state.outputTokens = Math.max(state.outputTokens, data.usage.output_tokens ?? data.usage.completion_tokens ?? 0);
         }
         if (eventType === 'message_stop') {
