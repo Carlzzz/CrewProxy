@@ -32,13 +32,13 @@
       "provider": "deepseek"
     },
     "gpt": {
-      "baseURL": "https://xingwan.store",
+      "baseURL": "https://zz.xingwan.store",
       "apiKey": "sk-rXTE4867NDX0A14sJPDMxQVjN2HcsD3WR3gaXJLRWPqamMG0",
       "model": "gpt-5.5",
       "provider": "gpt"
     },
     "claude": {
-      "baseURL": "https://xingwan.store",
+      "baseURL": "https://zz.xingwan.store",
       "apiKey": "sk-RnS464j6C1QlmyKDZczHMqWrNtAYtVlauqoO5FTeTqolD4KI",
       "model": "claude-opus-4-8",
       "provider": "claude"
