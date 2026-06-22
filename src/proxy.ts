@@ -1,14 +1,21 @@
 import * as http from 'http';
 import { logger } from './logger';
 import { ProxyRuntimeContext, UpstreamConfig, ResolvedUpstream, resolveUpstreamFromModel } from './config';
-import { CodePlanPoolManager, CODE_PLAN_COOLDOWN_MS } from './codePlanPool';
-import { isQuotaLimitedResponse, parseQuotaResetEpochMs } from './codePlanQuota';
+import { CodePlanPoolManager, CODE_PLAN_COOLDOWN_MS, CODE_PLAN_SHORT_COOLDOWN_MS } from './codePlanPool';
+import { classify429, parseQuotaResetEpochMs } from './codePlanQuota';
 import { buildAnthropicMessagesURL } from './formatTransform';
 import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
 import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow } from './contextBudget';
 
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
+
+/** Small randomised pause before retrying a different credential. Prevents
+ *  a burst of concurrent retries from re-triggering rate limits in lock-step. */
+function sleepWithJitter(baseMs: number, jitterMs: number): Promise<void> {
+  const delay = baseMs + Math.floor(Math.random() * jitterMs);
+  return new Promise(resolve => setTimeout(resolve, delay));
+}
 
 const USAGE_LOG_TAIL_PREVIEW_MAX = Math.max(
   4096,
@@ -745,7 +752,27 @@ async function handleRequest(
   const maxCredAttempts = hasCodePlan ? ((upstream.codePlanCredentials?.length ?? 0) + 1) : 1;
   let usedOrdinaryFallback = false;
 
+  // **Fix #1**: Skip the "ordinary fallback" branch when it can't usefully run:
+  //   (a) the upstream `apiKey` is empty — there's no real fallback configured;
+  //   (b) the upstream `apiKey` duplicates one of the pooled credentials — hitting
+  //       it again would just bounce off the same rate limit.
+  // In both cases, surface the upstream 429 to the caller instead of looping.
+  const ordinaryKeyIsPooled = !!(
+    hasCodePlan &&
+    (
+      !upstream.apiKey ||
+      upstream.codePlanCredentials?.some(c => c.apiKey === upstream.apiKey)
+    )
+  );
+
   for (let credAttempt = 0; credAttempt < maxCredAttempts; credAttempt++) {
+    // **Fix #3**: release the in-flight slot of the previous credential before
+    // picking the next one. pickOrFallback() increments on selection, so each
+    // pick must be paired with a decInFlight() somewhere.
+    if (hasCodePlan && pickedCredentialId !== null && !usedOrdinaryFallback) {
+      ctx.codePlanPool?.decInFlight(codePlanPoolKey, pickedCredentialId);
+    }
+
     // ── Select credential ──
     if (hasCodePlan) {
       const pick = ctx.codePlanPool!.pickOrFallback(
@@ -762,6 +789,13 @@ async function handleRequest(
         else effectiveBaseURL = upstream.baseURL;
         usedOrdinaryFallback = false;
         logger.verbose(`[${reqId}] CodePlan pick: ${pick.credentialId} (attempt=${credAttempt}) -> model: ${effectiveModel}`);
+      } else if (ordinaryKeyIsPooled) {
+        // **Fix #1 active path**: all pool keys are in cooldown and the ordinary
+        // key is a duplicate of one of them. Hitting it again would just bounce
+        // off the same rate limit. Surface the upstream 429 to the caller.
+        logger.verbose(`[${reqId}] CodePlan: all credentials exhausted; ordinary key matches a pooled credential, skipping fallback`);
+        pickedCredentialId = null;
+        break;
       } else {
         // All code plan credentials exhausted — fallback to ordinary key
         effectiveApiKey = upstream.apiKey;
@@ -830,8 +864,10 @@ async function handleRequest(
     // ── Network error (no response) — mark cooldown and retry ──
     if (!upstreamResponse) {
       if (pickedCredentialId !== null && !usedOrdinaryFallback) {
-        ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, CODE_PLAN_COOLDOWN_MS);
+        // Network errors are usually transient; short cooldown is sufficient.
+        ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, CODE_PLAN_SHORT_COOLDOWN_MS);
         logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId} after network error, retrying with next credential`);
+        await sleepWithJitter(50, 150);
         upstreamRequestBody = structuredClone(pristineRequestBody);
         continue;
       }
@@ -884,14 +920,18 @@ async function handleRequest(
     }
 
     // ── Mark credential cooldown on failure ──
+    // **Fix #2**: classify 429 — short cooldown for QPS/concurrency bursts,
+    // long cooldown only for true quota exhaustion.
     if (pickedCredentialId !== null && !usedOrdinaryFallback) {
-      let cooldownMs = CODE_PLAN_COOLDOWN_MS;
-      if (isQuotaLimitedResponse(upstreamResponse.status, errText)) {
+      let cooldownMs = CODE_PLAN_SHORT_COOLDOWN_MS;
+      const cls = classify429(upstreamResponse.status, errText);
+      if (cls === 'quota') {
+        cooldownMs = CODE_PLAN_COOLDOWN_MS;
         const resetMs = parseQuotaResetEpochMs(errText);
         if (resetMs) cooldownMs = Math.max(resetMs - Date.now(), CODE_PLAN_COOLDOWN_MS);
       }
       ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs);
-      logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId}: ${cooldownMs}ms`);
+      logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId}: ${cooldownMs}ms (class=${cls})`);
     }
 
     // ── Decide whether to retry with next credential ──
@@ -908,10 +948,26 @@ async function handleRequest(
       break;
     }
 
+    // **Fix #4**: jitter sleep before retrying with a different credential.
+    // Without it, a burst of concurrent retries lands on the next key in
+    // lock-step and can re-trigger short-window rate limits across the pool.
+    if (upstreamResponse.status === 429 || upstreamResponse.status >= 500) {
+      await sleepWithJitter(50, 150);
+    }
+
     // Reset request body and retry with next credential
     logger.verbose(`[${reqId}] Retrying with next credential (attempt=${credAttempt})`);
     upstreamRequestBody = structuredClone(pristineRequestBody);
     upstreamResponse = null;
+  }
+
+  // **Fix #3 final release**: decrement the last in-flight credential we held.
+  // Note: this happens before stream handling, so in-flight reflects "fetching
+  // headers" rather than "still streaming". That's the signal we want for
+  // picking the *next* credential — full stream-duration tracking would need
+  // handler cooperation and isn't the goal here.
+  if (hasCodePlan && pickedCredentialId !== null && !usedOrdinaryFallback) {
+    ctx.codePlanPool?.decInFlight(codePlanPoolKey, pickedCredentialId);
   }
 
   // Update usage extra with the final credential that was used
@@ -1055,7 +1111,7 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           sendJSONResponse(res, 200, { pools: {} });
           return;
         }
-        const pools: Record<string, { credentials: Array<{ id: string; model?: string; inCooldown: boolean; cooldownUntil?: number }> }> = {};
+        const pools: Record<string, { credentials: Array<{ id: string; model?: string; inCooldown: boolean; cooldownUntil?: number; requestsLast1h: number; inFlight: number }> }> = {};
         const allKeys = new Set<string>();
         for (const [upstreamId] of ctx.upstreamsByIdMap) allKeys.add(upstreamId);
         allKeys.add('__default__');
@@ -1067,6 +1123,8 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
               id: c.credentialId,
               inCooldown: c.inCooldown,
               cooldownUntil: c.cooldownUntil,
+              requestsLast1h: c.requestsLast1h,
+              inFlight: ctx.codePlanPool!.getInFlight(key, c.credentialId),
             })),
           };
           const upstream = ctx.upstreamsByIdMap.get(key) ?? ctx.defaultUpstream;

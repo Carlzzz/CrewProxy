@@ -17,11 +17,17 @@ export interface CredentialHeatmap {
 }
 
 export const CODE_PLAN_COOLDOWN_MS = 30 * 60 * 1000;
+export const CODE_PLAN_SHORT_COOLDOWN_MS = 30_000; // 30 s for rate-limit burst
 
 export class CodePlanPoolManager {
   private pool: Map<string, CodePlanCredential[]> = new Map();
-  private cooldowns: Map<string, number> = new Map();
+  private cooldowns: Map<string, number> = new Map();      // key → until-epoch-ms
   private roundRobin: Map<string, number> = new Map();
+  private inFlight: Map<string, number> = new Map();       // key → active-request-count
+  // Sliding window: key → sorted array of epoch-ms timestamps (last 1h)
+  private requestLog: Map<string, number[]> = new Map();
+  private sweepIntervalMs = 60_000;                         // sweep stale log entries every 1 min
+  private lastSweep = Date.now();
 
   reconcileFromConfig(config: ProxyConfig): void {
     this.pool.clear();
@@ -81,13 +87,28 @@ export class CodePlanPoolManager {
       // Should always find one since availableIndices.length > 0
       selectedIdx = found >= 0 ? found : availableIndices[0];
     } else {
-      // Round-robin on available set
-      const rrIdx = (this.roundRobin.get(upstreamKey) ?? 0) % availableIndices.length;
-      this.roundRobin.set(upstreamKey, rrIdx + 1);
-      selectedIdx = availableIndices[rrIdx];
+      // **Fix #3: pick the available credential with the LOWEST in-flight count**
+      let minIdx = availableIndices[0];
+      let minVal = this.inFlight.get(this.inFlightKey(upstreamKey, credentials[minIdx].id)) ?? 0;
+      for (let i = 1; i < availableIndices.length; i++) {
+        const idx = availableIndices[i];
+        const v = this.inFlight.get(this.inFlightKey(upstreamKey, credentials[idx].id)) ?? 0;
+        if (v < minVal) {
+          minVal = v;
+          minIdx = idx;
+        }
+      }
+      selectedIdx = minIdx;
     }
 
     const selected = credentials[selectedIdx];
+    const inflightKey = this.inFlightKey(upstreamKey, selected.id);
+    const cur = this.inFlight.get(inflightKey) ?? 0;
+    this.inFlight.set(inflightKey, cur + 1);
+
+    // Log request timestamp for 1h sliding window
+    this.logRequest(upstreamKey, selected.id);
+
     return {
       credentialId: selected.id,
       apiKey: selected.apiKey,
@@ -96,11 +117,24 @@ export class CodePlanPoolManager {
     };
   }
 
+  /** Call when the request finishes (success or terminal failure). */
+  decInFlight(upstreamKey: string, credentialId: string): void {
+    const k = this.inFlightKey(upstreamKey, credentialId);
+    const cur = this.inFlight.get(k) ?? 0;
+    if (cur <= 1) {
+      this.inFlight.delete(k);
+    } else {
+      this.inFlight.set(k, cur - 1);
+    }
+  }
+
   markCooldown(upstreamKey: string, credentialId: string, cooldownMs: number = CODE_PLAN_COOLDOWN_MS): void {
     const key = this.cooldownKey(upstreamKey, credentialId);
     this.cooldowns.set(key, Date.now() + cooldownMs);
     logger.verbose(`[codePlan] cooldown set for ${upstreamKey}/${credentialId}: ${cooldownMs}ms`);
   }
+
+  // ── private helpers ──
 
   private isInCooldown(upstreamKey: string, credentialId: string): boolean {
     const key = this.cooldownKey(upstreamKey, credentialId);
@@ -117,6 +151,10 @@ export class CodePlanPoolManager {
     return `${upstreamKey}\0${credentialId}`;
   }
 
+  private inFlightKey(upstreamKey: string, credentialId: string): string {
+    return `${upstreamKey}\0${credentialId}`;
+  }
+
   private cleanupStaleCooldowns(): void {
     const now = Date.now();
     for (const [key, expiry] of this.cooldowns.entries()) {
@@ -126,6 +164,50 @@ export class CodePlanPoolManager {
     }
   }
 
+  // ── Sliding-window request log ──
+
+  private logRequest(upstreamKey: string, credentialId: string): void {
+    this.sweepRequestLog();
+    const k = this.cooldownKey(upstreamKey, credentialId);
+    let arr = this.requestLog.get(k);
+    if (!arr) {
+      arr = [];
+      this.requestLog.set(k, arr);
+    }
+    arr.push(Date.now());
+  }
+
+  private sweepRequestLog(): void {
+    const now = Date.now();
+    if (now - this.lastSweep < this.sweepIntervalMs) return;
+    this.lastSweep = now;
+    const cutoff = now - 3_600_000; // 1 hour ago
+    for (const [k, arr] of this.requestLog) {
+      // Binary-sweep: find first index >= cutoff
+      let lo = 0, hi = arr.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid] < cutoff) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo > 0) {
+        // Clear the first `lo` stale entries (mutating in-place is safe because
+        // we copy only the tail portion, then replace).
+        const tail = arr.slice(lo);
+        this.requestLog.set(k, tail);
+      }
+    }
+  }
+
+  private countRecent1h(upstreamKey: string, credentialId: string): number {
+    this.sweepRequestLog();
+    const k = this.cooldownKey(upstreamKey, credentialId);
+    const arr = this.requestLog.get(k);
+    return arr?.length ?? 0;
+  }
+
+  // ── Public status / introspection ──
+
   getPoolStatus(upstreamKey: string): CredentialHeatmap[] {
     const credentials = this.pool.get(upstreamKey) ?? [];
     return credentials.map(c => {
@@ -134,12 +216,17 @@ export class CodePlanPoolManager {
       const inCooldown = expiry !== undefined && Date.now() < expiry;
       return {
         credentialId: c.id,
-        requestsLast1h: 0,
+        requestsLast1h: this.countRecent1h(upstreamKey, c.id),
         heatLast1h: 0,
         inCooldown,
         cooldownUntil: inCooldown ? expiry : undefined,
       };
     });
+  }
+
+  /** Return live in-flight count for a specific credential (0 if unknown). */
+  getInFlight(upstreamKey: string, credentialId: string): number {
+    return this.inFlight.get(this.inFlightKey(upstreamKey, credentialId)) ?? 0;
   }
 
   hasCredentials(upstreamKey: string): boolean {

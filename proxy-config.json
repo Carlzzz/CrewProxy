@@ -15,7 +15,7 @@
     },
     "minimax": {
       "baseURL": "https://api.minimaxi.com/anthropic",
-      "apiKey": "sk-cp-JAuqghZ2eX7kxqJDQpqOuqXulLKDTOf72Nl4J5dlp3TKkiZCnTAhikod1gP-X8p2xzvYboyCbl7yWii1WWZY9Dnnfk-i7GFEHfoKf4YqyzfYs74GLMp6tkM",
+      "apiKey": "",
       "model": "MiniMax-M3",
       "provider": "minimax",
       "codePlanCredentials": [
