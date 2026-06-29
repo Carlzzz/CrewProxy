@@ -27,7 +27,7 @@
     },
     "deepseek": {
       "baseURL": "https://api.deepseek.com/anthropic",
-      "apiKey": "sk-376edfd81a9b41a3af7895fce77383d4",
+      "apiKey": "sk-9237dd6a232c491b9f7a6064bae7865b",
       "model": "deepseek-v4-pro",
       "provider": "deepseek"
     },
