@@ -826,6 +826,14 @@ async function handleRequest(
     for (const hdr of ['anthropic-version', 'anthropic-beta']) {
       const val = req.headers[hdr];
       if (typeof val === 'string') {
+        // DeepSeek's Anthropic-compatible endpoint doesn't recognize Claude
+        // beta flags (context-1m, interleaved-thinking, fine-grained-tool-
+        // streaming, …); forwarding them can trigger upstream errors or odd
+        // behavior. Thinking itself is driven by the request-body `thinking`
+        // field (passed through), not this header, so dropping it is safe.
+        if (hdr === 'anthropic-beta' && provider === 'deepseek') {
+          continue;
+        }
         upstreamHeaders[hdr] = val;
       }
     }
