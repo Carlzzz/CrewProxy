@@ -15,9 +15,13 @@
     },
     "glm": {
       "baseURL": "https://open.bigmodel.cn/api/anthropic",
-      "apiKey": "80af09342418496ba392473ad8804cba.LFQMegoXucyKML37",
+      "apiKey": "",
       "model": "glm-5.2",
-      "provider": "glm"
+      "provider": "glm",
+      "codePlanCredentials": [
+        { "id": "glm-key1", "apiKey": "80af09342418496ba392473ad8804cba.LFQMegoXucyKML37", "weight": 1, "enabled": true },
+        { "id": "glm-key2", "apiKey": "40347a66080e418280f1d436a7925631.s6wIJNHi1S69V2TO", "weight": 1, "enabled": true }
+      ]
     },
     "minimax": {
       "baseURL": "https://api.minimaxi.com/anthropic",
