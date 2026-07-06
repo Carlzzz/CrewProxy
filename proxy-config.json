@@ -32,8 +32,8 @@
       "provider": "deepseek"
     },
     "gpt": {
-      "baseURL": "https://zz.xingwan.store",
-      "apiKey": "sk-rXTE4867NDX0A14sJPDMxQVjN2HcsD3WR3gaXJLRWPqamMG0",
+      "baseURL": "https://xingwan.store",
+      "apiKey": "sk-25553c24608580b2b22be117740011c40692cc69739efa25112126f3a1339d25",
       "model": "gpt-5.5",
       "provider": "gpt"
     },
