@@ -3,7 +3,7 @@
   "host": "0.0.0.0",
   "defaultUpstream": {
     "baseURL": "https://open.bigmodel.cn/api/anthropic",
-    "apiKey": "f4a059eded194ca1a479a89eaffe22d8.rx2wysSXN3lOqbHa",
+    "apiKey": "80af09342418496ba392473ad8804cba.LFQMegoXucyKML37",
     "model": "glm-5.2"
   },
   "upstreamsById": {
@@ -15,7 +15,7 @@
     },
     "glm": {
       "baseURL": "https://open.bigmodel.cn/api/anthropic",
-      "apiKey": "f4a059eded194ca1a479a89eaffe22d8.rx2wysSXN3lOqbHa",
+      "apiKey": "80af09342418496ba392473ad8804cba.LFQMegoXucyKML37",
       "model": "glm-5.2",
       "provider": "glm"
     },
