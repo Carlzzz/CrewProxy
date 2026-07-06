@@ -2,9 +2,9 @@
   "port": 3456,
   "host": "0.0.0.0",
   "defaultUpstream": {
-    "baseURL": "https://ark.cn-beijing.volces.com/api/coding",
-    "apiKey": "f5c4d134-0025-44c6-871f-3835e292aaa1",
-    "model": "doubao-seed-2.0-pro"
+    "baseURL": "https://open.bigmodel.cn/api/anthropic",
+    "apiKey": "f4a059eded194ca1a479a89eaffe22d8.rx2wysSXN3lOqbHa",
+    "model": "glm-5.2"
   },
   "upstreamsById": {
     "ark": {
@@ -12,6 +12,12 @@
       "apiKey": "f5c4d134-0025-44c6-871f-3835e292aaa1",
       "model": "doubao-seed-2.0-pro",
       "provider": "ark"
+    },
+    "glm": {
+      "baseURL": "https://open.bigmodel.cn/api/anthropic",
+      "apiKey": "f4a059eded194ca1a479a89eaffe22d8.rx2wysSXN3lOqbHa",
+      "model": "glm-5.2",
+      "provider": "glm"
     },
     "minimax": {
       "baseURL": "https://api.minimaxi.com/anthropic",
@@ -46,9 +52,7 @@
   },
   "modelRoutes": {
     "doubao-seed-2.0-pro": "ark",
-    "doubao-seed-2.0-code": "ark",
-    "glm-5.2": "ark",
-    "kimi-k2.6": "ark",
+    "glm-5.2": "glm",
     "MiniMax-M3": "minimax",
     "deepseek-v4-pro": "deepseek",
     "deepseek-v4-flash": "deepseek",
