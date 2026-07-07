@@ -40,9 +40,13 @@ export interface ProxyRuntimeContext {
   defaultUpstream: UpstreamConfig | undefined;
   modelRoutesMap: Map<string, ModelRouteTarget>;
   codePlanPool?: CodePlanPoolManager;
+  metrics?: MetricsCollector;
+  quotaFetcher?: QuotaFetcher;
 }
 
 import type { CodePlanPoolManager } from './codePlanPool';
+import type { MetricsCollector } from './metricsCollector';
+import type { QuotaFetcher } from './quotaFetcher';
 
 export interface ResolvedUpstream {
   upstream: UpstreamConfig;

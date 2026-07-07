@@ -456,7 +456,8 @@ async function handleAnthropicStreamResponse(
   modelId: string,
   startTime: string,
   upstreamReq: any,
-  extra: Partial<UsageLogExtra>
+  extra: Partial<UsageLogExtra>,
+  recordMetric?: (success: boolean, inputTokens: number, outputTokens: number) => void,
 ): Promise<void> {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -477,6 +478,7 @@ async function handleAnthropicStreamResponse(
     res.write(formatSSEEvent('error', { type: 'error', error: { type: 'api_error', message: 'Empty upstream response body' } }));
     res.end();
     appendUsageLog(clientId, modelId, startTime, 0, 0, extra as UsageLogExtra);
+    recordMetric?.(false, 0, 0);
     return;
   }
 
@@ -578,6 +580,8 @@ async function handleAnthropicStreamResponse(
       input_content: inputContent,
       output_content: outputContent,
     } as UsageLogExtra);
+
+    recordMetric?.(state.sawMessageStop, state.inputTokens, state.outputTokens);
 
     res.end();
   }
@@ -738,6 +742,20 @@ async function handleRequest(
   if (USAGE_LOG_INPUT_FULLTEXT === '1' || USAGE_LOG_INPUT_FULLTEXT === 'true') {
     usageExtra.input_fulltext = JSON.stringify(upstreamRequestBody);
   }
+
+  // ─── Metrics: record one event per request exit (success AND failure) ───
+  // `usageExtra.routing_key` is reassigned below (after the credential loop);
+  // the closure reads it at call time, so all exit calls see the final credential.
+  const startMs = new Date(startTime).getTime();
+  const recordMetric = (success: boolean, inTok: number, outTok: number): void => {
+    ctx.metrics?.record({
+      upstreamId: upstreamRouteId ?? '__default__',
+      credentialId: usageExtra.routing_key ?? undefined,
+      model: effectiveModel,
+      success, inputTokens: inTok, outputTokens: outTok,
+      costMs: Date.now() - startMs, ts: Date.now(),
+    });
+  };
 
   // ─── Code Plan credential retry loop ───
   // Each iteration picks a fresh credential from the pool (skipping cooldowns).
@@ -983,6 +1001,7 @@ async function handleRequest(
 
   // ── Final error check ──
   if (!upstreamResponse) {
+    recordMetric(false, 0, 0);
     sendErrorResponse(res, 502, `Upstream request failed: ${lastError?.message || 'unknown'}`, 'api_error');
     return;
   }
@@ -990,11 +1009,12 @@ async function handleRequest(
   if (!upstreamResponse.ok) {
     let errText = '';
     try { errText = await upstreamResponse.clone().text(); } catch {}
+    recordMetric(false, 0, 0);
     sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
     return;
   }
   if (parsedBody.stream) {
-    await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra);
+    await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric);
     return;
   }
 
@@ -1003,6 +1023,7 @@ async function handleRequest(
   try {
     anthropicResp = await upstreamResponse.json();
   } catch {
+    recordMetric(false, 0, 0);
     sendErrorResponse(res, 502, 'Failed to parse upstream response', 'api_error');
     return;
   }
@@ -1022,6 +1043,7 @@ async function handleRequest(
     response_size: JSON.stringify(anthropicResp).length,
   } as UsageLogExtra);
 
+  recordMetric(true, inputTokens, outputTokens);
   sendJSONResponse(res, 200, anthropicResp);
 }
 
