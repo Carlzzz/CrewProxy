@@ -1,9 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { config as dotenvConfig } from 'dotenv';
-import { loadConfig, parseProxyConfigObject, buildUpstreamsByIdMap, ProxyConfig } from './config';
+import { loadConfig, parseProxyConfigObject, buildUpstreamsByIdMap, ProxyConfig, UpstreamConfig } from './config';
 import { createProxyServer } from './proxy';
 import { CodePlanPoolManager } from './codePlanPool';
+import { MetricsCollector } from './metricsCollector';
+import { QuotaFetcher } from './quotaFetcher';
+import type { QuotaCredentialRef } from './quotaFetcher';
 import { logger } from './logger';
 
 dotenvConfig();
@@ -24,6 +27,28 @@ const ctx = buildUpstreamsByIdMap(currentConfig);
 const codePlanPool = new CodePlanPoolManager();
 codePlanPool.reconcileFromConfig(currentConfig);
 ctx.codePlanPool = codePlanPool;
+
+// Initialize metrics + quota fetcher
+const metrics = new MetricsCollector();
+ctx.metrics = metrics;
+
+function buildQuotaRefs(cfg: ProxyConfig): QuotaCredentialRef[] {
+  const refs: QuotaCredentialRef[] = [];
+  const collect = (upstreamId: string, u: UpstreamConfig | undefined) => {
+    if (!u || !u.codePlanCredentials) return;
+    for (const c of u.codePlanCredentials) {
+      if (c.enabled && c.apiKey) refs.push({ upstreamId, credentialId: c.id, apiKey: c.apiKey, baseURL: u.baseURL });
+    }
+  };
+  if (cfg.upstreamsById) for (const [id, u] of Object.entries(cfg.upstreamsById)) collect(id, u);
+  if (cfg.defaultUpstream) collect('__default__', cfg.defaultUpstream);
+  return refs;
+}
+
+const quotaFetcher = new QuotaFetcher();
+quotaFetcher.reload(buildQuotaRefs(currentConfig));
+quotaFetcher.start();
+ctx.quotaFetcher = quotaFetcher;
 
 const port = currentConfig.port || 3456;
 const host = currentConfig.host || '0.0.0.0';
@@ -81,6 +106,7 @@ if (fs.existsSync(configFilePath)) {
         ctx.modelRoutesMap = newCtx.modelRoutesMap;
         codePlanPool.reconcileFromConfig(newConfig);
         currentConfig = newConfig;
+        quotaFetcher.reload(buildQuotaRefs(newConfig));
 
         logger.info('Config reloaded successfully');
       } catch (err) {
@@ -91,3 +117,6 @@ if (fs.existsSync(configFilePath)) {
 
   logger.info(`Watching config: ${configFilePath}`);
 }
+
+process.on('SIGTERM', () => { quotaFetcher.stop(); server.close(() => process.exit(0)); });
+process.on('SIGINT', () => { quotaFetcher.stop(); server.close(() => process.exit(0)); });
