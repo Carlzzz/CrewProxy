@@ -73,6 +73,7 @@ export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
       let quota: any = null;
       if (q && q.status === 'ok') {
         quota = {};
+        quota.estimated = q.estimated ?? false;
         if (q.fiveHour) {
           const limit = upstream.quotaLimits?.fiveHourTokens ?? null;
           quota.fiveHour = {
@@ -102,7 +103,6 @@ export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
         quota,
         quotaStatus: q?.status ?? 'not_configured',
         quotaError: q?.error ?? null,
-        estimated: q?.estimated ?? false,
       };
     });
 

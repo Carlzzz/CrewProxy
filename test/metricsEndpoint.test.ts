@@ -94,7 +94,7 @@ test('/metrics surfaces estimated flag on credentials', async () => {
     const glm = r.body.providers.find((p: any) => p.upstreamId === 'glm');
     const cred = glm.credentials[0];
     assert.equal(cred.quotaStatus, 'ok');
-    assert.equal(cred.estimated, true);
+    assert.equal(cred.quota.estimated, true);
     assert.equal(cred.quota.fiveHour.resetsAt, null);
     assert.equal(cred.quota.fiveHour.usedTokens, 16_000_000); // 10% of 1.6亿
   } finally { server.close(); delete process.env.WOICLAW_AUTH_BYPASS; }
