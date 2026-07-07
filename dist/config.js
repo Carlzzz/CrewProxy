@@ -54,6 +54,21 @@ function normalizeUpstream(u) {
         out.ordinaryFallbackModelMap = Object.fromEntries(Object.entries(o.ordinaryFallbackModelMap)
             .map(([k, v]) => [k, String(v)]));
     }
+    if (o.quotaLimits !== undefined && o.quotaLimits !== null && typeof o.quotaLimits === 'object') {
+        const ql = o.quotaLimits;
+        const fiveHourTokens = typeof ql.fiveHourTokens === 'number' ? ql.fiveHourTokens : undefined;
+        const weeklyTokens = typeof ql.weeklyTokens === 'number' ? ql.weeklyTokens : undefined;
+        if (fiveHourTokens !== undefined || weeklyTokens !== undefined) {
+            out.quotaLimits = {};
+            if (fiveHourTokens !== undefined)
+                out.quotaLimits.fiveHourTokens = fiveHourTokens;
+            if (weeklyTokens !== undefined)
+                out.quotaLimits.weeklyTokens = weeklyTokens;
+        }
+    }
+    if (o.quotaMode === 'fetch' || o.quotaMode === 'estimated') {
+        out.quotaMode = o.quotaMode;
+    }
     return out;
 }
 function readConfigFile(filePath) {

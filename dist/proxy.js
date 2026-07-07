@@ -44,6 +44,7 @@ const codePlanQuota_1 = require("./codePlanQuota");
 const formatTransform_1 = require("./formatTransform");
 const usageLogger_1 = require("./usageLogger");
 const contextBudget_1 = require("./contextBudget");
+const metricsPayload_1 = require("./metricsPayload");
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
 /** Small randomised pause before retrying a different credential. Prevents
@@ -440,7 +441,7 @@ function readWithTimeout(reader, timeoutMs, abortSignal) {
         });
     });
 }
-async function handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, modelId, startTime, upstreamReq, extra) {
+async function handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, modelId, startTime, upstreamReq, extra, recordMetric) {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
@@ -458,6 +459,7 @@ async function handleAnthropicStreamResponse(upstreamResponse, req, res, clientI
         res.write(formatSSEEvent('error', { type: 'error', error: { type: 'api_error', message: 'Empty upstream response body' } }));
         res.end();
         (0, usageLogger_1.appendUsageLog)(clientId, modelId, startTime, 0, 0, extra);
+        recordMetric?.(false, 0, 0);
         return;
     }
     const reader = body.getReader();
@@ -556,6 +558,7 @@ async function handleAnthropicStreamResponse(upstreamResponse, req, res, clientI
             input_content: inputContent,
             output_content: outputContent,
         });
+        recordMetric?.(state.sawMessageStop, state.inputTokens, state.outputTokens);
         res.end();
     }
 }
@@ -690,6 +693,20 @@ async function handleRequest(req, res, ctx) {
     if (USAGE_LOG_INPUT_FULLTEXT === '1' || USAGE_LOG_INPUT_FULLTEXT === 'true') {
         usageExtra.input_fulltext = JSON.stringify(upstreamRequestBody);
     }
+    // ─── Metrics: record one event per request exit (success AND failure) ───
+    // `usageExtra.routing_key` is reassigned below (after the credential loop);
+    // the closure reads it at call time, so all exit calls see the final credential.
+    const startMs = new Date(startTime).getTime();
+    const recordMetric = (success, inTok, outTok) => {
+        ctx.tokenUsage?.record(upstreamRouteId ?? '__default__', (inTok || 0) + (outTok || 0));
+        ctx.metrics?.record({
+            upstreamId: upstreamRouteId ?? '__default__',
+            credentialId: usageExtra.routing_key ?? undefined,
+            model: effectiveModel,
+            success, inputTokens: inTok, outputTokens: outTok,
+            costMs: Date.now() - startMs, ts: Date.now(),
+        });
+    };
     // ─── Code Plan credential retry loop ───
     // Each iteration picks a fresh credential from the pool (skipping cooldowns).
     // On network error / 429 / 5xx: mark cooldown, retry with next credential.
@@ -769,6 +786,14 @@ async function handleRequest(req, res, ctx) {
         for (const hdr of ['anthropic-version', 'anthropic-beta']) {
             const val = req.headers[hdr];
             if (typeof val === 'string') {
+                // DeepSeek's Anthropic-compatible endpoint doesn't recognize Claude
+                // beta flags (context-1m, interleaved-thinking, fine-grained-tool-
+                // streaming, …); forwarding them can trigger upstream errors or odd
+                // behavior. Thinking itself is driven by the request-body `thinking`
+                // field (passed through), not this header, so dropping it is safe.
+                if (hdr === 'anthropic-beta' && provider === 'deepseek') {
+                    continue;
+                }
                 upstreamHeaders[hdr] = val;
             }
         }
@@ -804,7 +829,7 @@ async function handleRequest(req, res, ctx) {
         if (!upstreamResponse) {
             if (pickedCredentialId !== null && !usedOrdinaryFallback) {
                 // Network errors are usually transient; short cooldown is sufficient.
-                ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, codePlanPool_1.CODE_PLAN_SHORT_COOLDOWN_MS);
+                ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, codePlanPool_1.CODE_PLAN_SHORT_COOLDOWN_MS, 'network');
                 logger_1.logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId} after network error, retrying with next credential`);
                 await sleepWithJitter(50, 150);
                 upstreamRequestBody = structuredClone(pristineRequestBody);
@@ -873,7 +898,7 @@ async function handleRequest(req, res, ctx) {
                 if (resetMs)
                     cooldownMs = Math.max(resetMs - Date.now(), codePlanPool_1.CODE_PLAN_COOLDOWN_MS);
             }
-            ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs);
+            ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs, cls === 'quota' ? 'quota' : 'rate_limit');
             logger_1.logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId}: ${cooldownMs}ms (class=${cls})`);
         }
         // ── Decide whether to retry with next credential ──
@@ -911,6 +936,7 @@ async function handleRequest(req, res, ctx) {
     usageExtra.routing_key = pickedCredentialId ?? upstreamRouteId ?? '__default__';
     // ── Final error check ──
     if (!upstreamResponse) {
+        recordMetric(false, 0, 0);
         sendErrorResponse(res, 502, `Upstream request failed: ${lastError?.message || 'unknown'}`, 'api_error');
         return;
     }
@@ -920,11 +946,12 @@ async function handleRequest(req, res, ctx) {
             errText = await upstreamResponse.clone().text();
         }
         catch { }
+        recordMetric(false, 0, 0);
         sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
         return;
     }
     if (parsedBody.stream) {
-        await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra);
+        await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric);
         return;
     }
     // ─── Non-stream response: pass Anthropic response directly ───
@@ -933,6 +960,7 @@ async function handleRequest(req, res, ctx) {
         anthropicResp = await upstreamResponse.json();
     }
     catch {
+        recordMetric(false, 0, 0);
         sendErrorResponse(res, 502, 'Failed to parse upstream response', 'api_error');
         return;
     }
@@ -949,6 +977,7 @@ async function handleRequest(req, res, ctx) {
         output_content: outputContent,
         response_size: JSON.stringify(anthropicResp).length,
     });
+    recordMetric(true, inputTokens, outputTokens);
     sendJSONResponse(res, 200, anthropicResp);
 }
 // ─── Server factory ───
@@ -1060,6 +1089,21 @@ function createProxyServer(ctx) {
                     }
                 }
                 sendJSONResponse(res, 200, { pools });
+                return;
+            }
+            if (method === 'GET' && pathname === '/metrics') {
+                // Auth aligned with /models (NOT the unauthenticated /pool-status).
+                const clientApiKey = extractClientApiKey(req);
+                if (!clientApiKey) {
+                    sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
+                    return;
+                }
+                const authResult = await authenticateRequest(clientApiKey);
+                if (!authResult) {
+                    sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+                    return;
+                }
+                sendJSONResponse(res, 200, (0, metricsPayload_1.buildMetricsPayload)(ctx));
                 return;
             }
             sendErrorResponse(res, 404, `Not found: ${method} ${url}`, 'not_found_error');

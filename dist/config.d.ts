@@ -14,6 +14,11 @@ export interface UpstreamConfig {
     codePlanBaseURL?: string;
     codePlanAnthropicBaseURL?: string;
     ordinaryFallbackModelMap?: Record<string, string>;
+    quotaLimits?: {
+        fiveHourTokens?: number;
+        weeklyTokens?: number;
+    };
+    quotaMode?: 'fetch' | 'estimated';
 }
 export interface ModelRouteTarget {
     upstream: string;
@@ -31,8 +36,14 @@ export interface ProxyRuntimeContext {
     defaultUpstream: UpstreamConfig | undefined;
     modelRoutesMap: Map<string, ModelRouteTarget>;
     codePlanPool?: CodePlanPoolManager;
+    metrics?: MetricsCollector;
+    quotaFetcher?: QuotaFetcher;
+    tokenUsage?: TokenUsageTracker;
 }
 import type { CodePlanPoolManager } from './codePlanPool';
+import type { MetricsCollector } from './metricsCollector';
+import type { QuotaFetcher } from './quotaFetcher';
+import type { TokenUsageTracker } from './tokenUsageTracker';
 export interface ResolvedUpstream {
     upstream: UpstreamConfig;
     modelId: string;
