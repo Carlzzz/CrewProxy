@@ -43,11 +43,13 @@ export interface ProxyRuntimeContext {
   codePlanPool?: CodePlanPoolManager;
   metrics?: MetricsCollector;
   quotaFetcher?: QuotaFetcher;
+  tokenUsage?: TokenUsageTracker;
 }
 
 import type { CodePlanPoolManager } from './codePlanPool';
 import type { MetricsCollector } from './metricsCollector';
 import type { QuotaFetcher } from './quotaFetcher';
+import type { TokenUsageTracker } from './tokenUsageTracker';
 
 export interface ResolvedUpstream {
   upstream: UpstreamConfig;

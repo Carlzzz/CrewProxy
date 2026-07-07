@@ -749,6 +749,7 @@ async function handleRequest(
   // the closure reads it at call time, so all exit calls see the final credential.
   const startMs = new Date(startTime).getTime();
   const recordMetric = (success: boolean, inTok: number, outTok: number): void => {
+    ctx.tokenUsage?.record(upstreamRouteId ?? '__default__', (inTok || 0) + (outTok || 0));
     ctx.metrics?.record({
       upstreamId: upstreamRouteId ?? '__default__',
       credentialId: usageExtra.routing_key ?? undefined,
