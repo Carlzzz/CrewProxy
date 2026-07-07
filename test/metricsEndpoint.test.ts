@@ -71,4 +71,32 @@ test('/metrics returns schema with totals and providers', async () => {
     assert.equal(glm.credentials[0].id, 'glm-key1');
   } finally { server.close(); }
 });
+
+test('/metrics surfaces estimated flag on credentials', async () => {
+  process.env.WOICLAW_AUTH_BYPASS = '1';
+  const ctx: ProxyRuntimeContext = {
+    upstreamsByIdMap: new Map([
+      ['glm', { baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'x', model: 'glm-5.2',
+        quotaMode: 'estimated', quotaLimits: { fiveHourTokens: 160_000_000 },
+        codePlanCredentials: [{ id: 'glm-key1', apiKey: 'k1', weight: 1, enabled: true }] }],
+    ]),
+    defaultUpstream: undefined,
+    modelRoutesMap: new Map(),
+    codePlanPool: new CodePlanPoolManager(),
+    metrics: new MetricsCollector(() => 10_000_000_000),
+    quotaFetcher: { getSnapshot: () => new Map([['glm\0glm-key1', { status: 'ok', estimated: true, fiveHour: { usedPct: 10, resetsAt: null }, queriedAt: 1 }]]) } as any,
+  };
+  ctx.codePlanPool!.reconcileFromConfig({ upstreamsById: Object.fromEntries(ctx.upstreamsByIdMap) } as any);
+  const server = createProxyServer(ctx);
+  const { port } = await new Promise<{port:number}>(r => server.listen(0, '127.0.0.1', () => r({ port: (server.address() as any).port })));
+  try {
+    const r = await get(port, '/metrics', { 'x-api-key': 'dummy' });
+    const glm = r.body.providers.find((p: any) => p.upstreamId === 'glm');
+    const cred = glm.credentials[0];
+    assert.equal(cred.quotaStatus, 'ok');
+    assert.equal(cred.estimated, true);
+    assert.equal(cred.quota.fiveHour.resetsAt, null);
+    assert.equal(cred.quota.fiveHour.usedTokens, 16_000_000); // 10% of 1.6亿
+  } finally { server.close(); delete process.env.WOICLAW_AUTH_BYPASS; }
+});
 });

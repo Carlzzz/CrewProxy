@@ -102,6 +102,7 @@ export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
         quota,
         quotaStatus: q?.status ?? 'not_configured',
         quotaError: q?.error ?? null,
+        estimated: q?.estimated ?? false,
       };
     });
 
