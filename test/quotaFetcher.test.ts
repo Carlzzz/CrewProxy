@@ -100,3 +100,36 @@ test('QuotaFetcher not_configured for unknown provider', async () => {
   await qf.refreshOnce();
   assert.equal(qf.getSnapshot().get('ark\0ark1')!.status, 'not_configured');
 });
+
+// ── Fix 1b: retain last successful tiers across a transient error ──
+test('QuotaFetcher retains prior tiers when a refresh returns HTTP error', async () => {
+  let calls = 0;
+  const fakeFetch = (async (url: string) => {
+    calls++;
+    const u = String(url);
+    if (!u.includes('bigmodel.cn')) return new Response('not found', { status: 404 });
+    if (calls === 1) {
+      return new Response(JSON.stringify({ success: true, data: { limits: [
+        { type: 'TOKENS_LIMIT', unit: 3, percentage: 27.5, nextResetTime: 1_800_000_000_000 },
+      ]}}), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    // second call: transient server error
+    return new Response('server error', { status: 500 });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1_700_000_000_000 });
+  qf.reload([{ upstreamId: 'glm', credentialId: 'glm-key1', apiKey: 'KEY', baseURL: 'https://open.bigmodel.cn/api/paas/v4' }]);
+
+  await qf.refreshOnce();
+  const afterFirst = qf.getSnapshot().get('glm\0glm-key1')!;
+  assert.equal(afterFirst.status, 'ok');
+  assert.equal(afterFirst.fiveHour!.usedPct, 27.5);
+
+  await qf.refreshOnce();
+  const afterSecond = qf.getSnapshot().get('glm\0glm-key1')!;
+  assert.equal(afterSecond.status, 'error');
+  assert.equal(afterSecond.error, 'GLM HTTP 500');
+  // prior tiers must survive the transient error (Fix 1b)
+  assert.ok(afterSecond.fiveHour, 'fiveHour must be retained from prior success');
+  assert.equal(afterSecond.fiveHour!.usedPct, 27.5);
+});

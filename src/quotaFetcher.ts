@@ -104,7 +104,7 @@ async function queryGlm(ref: QuotaCredentialRef, fetchImpl: typeof fetch): Promi
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (resp.status === 401 || resp.status === 403) return { status: 'expired', queriedAt: Date.now() };
-  if (!resp.ok) return { status: 'error', error: `GLM HTTP ${resp.status}`, queriedAt: Date.now() };
+  if (!resp.ok) { logger.verbose(`[quota] GLM non-2xx ${resp.status} for ${ref.upstreamId}`); return { status: 'error', error: `GLM HTTP ${resp.status}`, queriedAt: Date.now() }; }
   const body: any = await resp.json();
   if (body?.success === false) return { status: 'error', error: `GLM: ${body.msg ?? 'unknown'}`, queriedAt: Date.now() };
   const tiers = parseGlmTiers(body?.data);
@@ -120,7 +120,7 @@ async function queryMinimax(ref: QuotaCredentialRef, fetchImpl: typeof fetch): P
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (resp.status === 401 || resp.status === 403) return { status: 'expired', queriedAt: Date.now() };
-  if (!resp.ok) return { status: 'error', error: `MiniMax HTTP ${resp.status}`, queriedAt: Date.now() };
+  if (!resp.ok) { logger.verbose(`[quota] MiniMax non-2xx ${resp.status} for ${ref.upstreamId}`); return { status: 'error', error: `MiniMax HTTP ${resp.status}`, queriedAt: Date.now() }; }
   const body: any = await resp.json();
   if (body?.base_resp?.status_code !== undefined && body.base_resp.status_code !== 0) {
     return { status: 'error', error: `MiniMax code ${body.base_resp.status_code}: ${body.base_resp.status_msg ?? ''}`, queriedAt: Date.now() };
@@ -165,10 +165,23 @@ export class QuotaFetcher {
       if (!provider) { this.snapshot.set(key, { status: 'not_configured', queriedAt: this.now() }); return; }
       try {
         const result = provider === 'glm' ? await queryGlm(ref, this.fetchImpl) : await queryMinimax(ref, this.fetchImpl);
+        if (result.status === 'error') {
+          const prior = this.snapshot.get(key);
+          if (prior) {
+            if (prior.fiveHour && !result.fiveHour) result.fiveHour = prior.fiveHour;
+            if (prior.weekly && !result.weekly) result.weekly = prior.weekly;
+          }
+        }
         this.snapshot.set(key, result);
       } catch (err) {
         logger.error(`[quota] query failed for ${key}:`, err);
-        this.snapshot.set(key, { status: 'error', error: String((err as Error)?.message ?? err), queriedAt: this.now() });
+        const result: CredentialQuota = { status: 'error', error: String((err as Error)?.message ?? err), queriedAt: this.now() };
+        const prior = this.snapshot.get(key);
+        if (prior) {
+          if (prior.fiveHour && !result.fiveHour) result.fiveHour = prior.fiveHour;
+          if (prior.weekly && !result.weekly) result.weekly = prior.weekly;
+        }
+        this.snapshot.set(key, result);
       }
     }));
   }

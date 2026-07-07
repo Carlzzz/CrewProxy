@@ -61,10 +61,9 @@ export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
       allDown = poolStatus.every(c => c.inCooldown);
       partialCooldown = poolStatus.some(c => c.inCooldown);
     }
-    const successRate5m = s5m?.successRate ?? 1;
     let health: 'healthy' | 'degraded' | 'down' = 'healthy';
     if (allDown) health = 'down';
-    else if (partialCooldown || (s5m && s5m.count > 0 && successRate5m < DEGRADED_SUCCESS_RATE)) health = 'degraded';
+    else if (partialCooldown || (s5m && s5m.count > 0 && s5m.successRate < DEGRADED_SUCCESS_RATE)) health = 'degraded';
     if (health === 'down') downCount++; else activeCount++;
 
     // Credentials
@@ -96,12 +95,13 @@ export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
       return {
         id: c.id,
         inCooldown: heat?.inCooldown ?? false,
-        cooldownUntil: heat?.cooldownUntil,
-        cooldownReason: heat?.cooldownReason,
+        cooldownUntil: heat?.cooldownUntil ?? null,
+        cooldownReason: heat?.cooldownReason ?? null,
         inFlight: ctx.codePlanPool?.getInFlight(upstreamId, c.id) ?? 0,
         requestsLast1h: heat?.requestsLast1h ?? 0,
         quota,
         quotaStatus: q?.status ?? 'not_configured',
+        quotaError: q?.error ?? null,
       };
     });
 
