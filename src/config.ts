@@ -19,6 +19,7 @@ export interface UpstreamConfig {
   codePlanBaseURL?: string;
   codePlanAnthropicBaseURL?: string;
   ordinaryFallbackModelMap?: Record<string, string>;
+  quotaLimits?: { fiveHourTokens?: number; weeklyTokens?: number };
 }
 
 export interface ModelRouteTarget {
@@ -93,6 +94,16 @@ export function normalizeUpstream(u: unknown): UpstreamConfig {
       Object.entries(o.ordinaryFallbackModelMap as Record<string, unknown>)
         .map(([k, v]) => [k, String(v)])
     );
+  }
+  if (o.quotaLimits !== undefined && o.quotaLimits !== null && typeof o.quotaLimits === 'object') {
+    const ql = o.quotaLimits as Record<string, unknown>;
+    const fiveHourTokens = typeof ql.fiveHourTokens === 'number' ? ql.fiveHourTokens : undefined;
+    const weeklyTokens = typeof ql.weeklyTokens === 'number' ? ql.weeklyTokens : undefined;
+    if (fiveHourTokens !== undefined || weeklyTokens !== undefined) {
+      out.quotaLimits = {};
+      if (fiveHourTokens !== undefined) out.quotaLimits.fiveHourTokens = fiveHourTokens;
+      if (weeklyTokens !== undefined) out.quotaLimits.weeklyTokens = weeklyTokens;
+    }
   }
   return out;
 }
