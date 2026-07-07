@@ -21,7 +21,8 @@
       "codePlanCredentials": [
         { "id": "glm-key1", "apiKey": "80af09342418496ba392473ad8804cba.LFQMegoXucyKML37", "weight": 1, "enabled": true },
         { "id": "glm-key2", "apiKey": "40347a66080e418280f1d436a7925631.s6wIJNHi1S69V2TO", "weight": 1, "enabled": true }
-      ]
+      ],
+      "quotaLimits": { "fiveHourTokens": 160000000 }
     },
     "minimax": {
       "baseURL": "https://api.minimaxi.com/anthropic",

@@ -247,3 +247,51 @@ The proxy is a single-process Node.js HTTP server. For horizontal scaling,
 deploy behind an ADC / load balancer with sticky sessions disabled (the proxy
 is stateless per-request; tool-call extra-content cache is per-instance but
 optional).
+
+## Monitoring: GET /metrics
+
+Returns real-time gateway metrics (call stats, pool cooldowns, GLM/MiniMax quota) as JSON.
+Auth: same as `/models` (x-api-key or Authorization: Bearer). Intended for the CrewCentral
+monitoring dashboard. Optional per-upstream `quotaLimits` in proxy-config.json renders
+absolute token usage (e.g. GLM 1.6亿/5h).
+
+Top-level fields:
+
+| Field | Description |
+|-------|-------------|
+| `ts` | Unix ms timestamp of this snapshot. |
+| `gatewayOnline` | Always `true` while the process is serving. |
+| `totals` | Aggregated call counts across all upstreams for `last1m` / `last5m` / `last1h` (`count`, `success`, `fail`, `successRate`, `inputTokens`, `outputTokens`, `avgCostMs`). |
+| `activeProviders` / `downProviders` | Number of upstreams not in / in full-cooldown state. |
+| `providers` | Per-upstream object: `upstreamId`, `provider`, `model`, `health` (`healthy` / `degraded` / `down`), `stats` (same window shape as `totals`), and `credentials[]`. |
+
+Each entry in `credentials[]`:
+
+| Field | Description |
+|-------|-------------|
+| `id` | Credential id from `codePlanCredentials`. |
+| `inCooldown` / `cooldownUntil` / `cooldownReason` | Current cooldown state from the code-plan pool. |
+| `inFlight` | Active in-flight requests for this credential. |
+| `requestsLast1h` | Requests seen in the last hour. |
+| `quota` | Quota snapshot when `quotaStatus === 'ok'`, else `null`. For GLM contains `fiveHour` (with `limitTokens` from `quotaLimits.fiveHourTokens` if set); for MiniMax contains `weekly`. |
+| `quotaStatus` | `ok` (real quota returned) · `expired` (key rejected) · `error` (network/API issue) · `not_configured` (no fetcher for this provider). |
+
+Example:
+
+```bash
+curl -s -H "x-api-key: $KEY" http://127.0.0.1:3456/metrics | jq '.totals.last5m, .providers[] | {upstreamId, health, quotaStatus: .credentials[].quotaStatus}'
+```
+
+To opt a GLM/MiniMax upstream into absolute-token display, add `quotaLimits` next to
+`baseURL` / `apiKey` / `codePlanCredentials`:
+
+```jsonc
+"glm": {
+  "baseURL": "https://open.bigmodel.cn/api/anthropic",
+  "apiKey": "",
+  "model": "glm-5.2",
+  "provider": "glm",
+  "codePlanCredentials": [ /* ... */ ],
+  "quotaLimits": { "fiveHourTokens": 160000000 }   // optional: surfaces quota.fiveHour.limitTokens
+}
+```
