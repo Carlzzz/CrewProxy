@@ -873,7 +873,7 @@ async function handleRequest(
     if (!upstreamResponse) {
       if (pickedCredentialId !== null && !usedOrdinaryFallback) {
         // Network errors are usually transient; short cooldown is sufficient.
-        ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, CODE_PLAN_SHORT_COOLDOWN_MS);
+        ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, CODE_PLAN_SHORT_COOLDOWN_MS, 'network');
         logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId} after network error, retrying with next credential`);
         await sleepWithJitter(50, 150);
         upstreamRequestBody = structuredClone(pristineRequestBody);
@@ -938,7 +938,7 @@ async function handleRequest(
         const resetMs = parseQuotaResetEpochMs(errText);
         if (resetMs) cooldownMs = Math.max(resetMs - Date.now(), CODE_PLAN_COOLDOWN_MS);
       }
-      ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs);
+      ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, cooldownMs, cls === 'quota' ? 'quota' : 'rate_limit');
       logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId}: ${cooldownMs}ms (class=${cls})`);
     }
 

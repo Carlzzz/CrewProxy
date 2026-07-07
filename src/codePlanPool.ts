@@ -14,14 +14,18 @@ export interface CredentialHeatmap {
   heatLast1h: number;
   inCooldown: boolean;
   cooldownUntil?: number;
+  cooldownReason?: CooldownReason;
 }
 
 export const CODE_PLAN_COOLDOWN_MS = 30 * 60 * 1000;
 export const CODE_PLAN_SHORT_COOLDOWN_MS = 30_000; // 30 s for rate-limit burst
 
+export type CooldownReason = 'quota' | 'rate_limit' | 'network';
+
 export class CodePlanPoolManager {
   private pool: Map<string, CodePlanCredential[]> = new Map();
   private cooldowns: Map<string, number> = new Map();      // key → until-epoch-ms
+  private cooldownReasons: Map<string, CooldownReason> = new Map();
   private roundRobin: Map<string, number> = new Map();
   private inFlight: Map<string, number> = new Map();       // key → active-request-count
   // Sliding window: key → sorted array of epoch-ms timestamps (last 1h)
@@ -128,10 +132,11 @@ export class CodePlanPoolManager {
     }
   }
 
-  markCooldown(upstreamKey: string, credentialId: string, cooldownMs: number = CODE_PLAN_COOLDOWN_MS): void {
+  markCooldown(upstreamKey: string, credentialId: string, cooldownMs: number = CODE_PLAN_COOLDOWN_MS, reason: CooldownReason = 'rate_limit'): void {
     const key = this.cooldownKey(upstreamKey, credentialId);
     this.cooldowns.set(key, Date.now() + cooldownMs);
-    logger.verbose(`[codePlan] cooldown set for ${upstreamKey}/${credentialId}: ${cooldownMs}ms`);
+    this.cooldownReasons.set(key, reason);
+    logger.verbose(`[codePlan] cooldown set for ${upstreamKey}/${credentialId}: ${cooldownMs}ms (reason=${reason})`);
   }
 
   // ── private helpers ──
@@ -160,6 +165,7 @@ export class CodePlanPoolManager {
     for (const [key, expiry] of this.cooldowns.entries()) {
       if (now > expiry) {
         this.cooldowns.delete(key);
+        this.cooldownReasons.delete(key);
       }
     }
   }
@@ -220,6 +226,7 @@ export class CodePlanPoolManager {
         heatLast1h: 0,
         inCooldown,
         cooldownUntil: inCooldown ? expiry : undefined,
+        cooldownReason: inCooldown ? this.cooldownReasons.get(key) : undefined,
       };
     });
   }
