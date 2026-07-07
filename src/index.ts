@@ -6,7 +6,8 @@ import { createProxyServer } from './proxy';
 import { CodePlanPoolManager } from './codePlanPool';
 import { MetricsCollector } from './metricsCollector';
 import { QuotaFetcher } from './quotaFetcher';
-import type { QuotaCredentialRef } from './quotaFetcher';
+import type { QuotaUpstreamRef } from './quotaFetcher';
+import { TokenUsageTracker } from './tokenUsageTracker';
 import { logger } from './logger';
 
 dotenvConfig();
@@ -32,21 +33,31 @@ ctx.codePlanPool = codePlanPool;
 const metrics = new MetricsCollector();
 ctx.metrics = metrics;
 
-function buildQuotaRefs(cfg: ProxyConfig): QuotaCredentialRef[] {
-  const refs: QuotaCredentialRef[] = [];
+const tokenUsage = new TokenUsageTracker();
+ctx.tokenUsage = tokenUsage;
+
+function buildQuotaUpstreams(cfg: ProxyConfig): QuotaUpstreamRef[] {
+  const out: QuotaUpstreamRef[] = [];
   const collect = (upstreamId: string, u: UpstreamConfig | undefined) => {
     if (!u || !u.codePlanCredentials) return;
-    for (const c of u.codePlanCredentials) {
-      if (c.enabled && c.apiKey) refs.push({ upstreamId, credentialId: c.id, apiKey: c.apiKey, baseURL: u.baseURL });
-    }
+    const credentials = u.codePlanCredentials
+      .filter(c => c.enabled && c.apiKey)
+      .map(c => ({ upstreamId, credentialId: c.id, apiKey: c.apiKey, baseURL: u.baseURL }));
+    if (credentials.length === 0) return;
+    out.push({
+      upstreamId,
+      quotaMode: u.quotaMode ?? 'fetch',
+      quotaLimits: u.quotaLimits,
+      credentials,
+    });
   };
   if (cfg.upstreamsById) for (const [id, u] of Object.entries(cfg.upstreamsById)) collect(id, u);
   if (cfg.defaultUpstream) collect('__default__', cfg.defaultUpstream);
-  return refs;
+  return out;
 }
 
-const quotaFetcher = new QuotaFetcher();
-quotaFetcher.reload(buildQuotaRefs(currentConfig));
+const quotaFetcher = new QuotaFetcher({ tokenUsageTracker: tokenUsage });
+quotaFetcher.reload(buildQuotaUpstreams(currentConfig));
 quotaFetcher.start();
 ctx.quotaFetcher = quotaFetcher;
 
@@ -106,7 +117,7 @@ if (fs.existsSync(configFilePath)) {
         ctx.modelRoutesMap = newCtx.modelRoutesMap;
         codePlanPool.reconcileFromConfig(newConfig);
         currentConfig = newConfig;
-        quotaFetcher.reload(buildQuotaRefs(newConfig));
+        quotaFetcher.reload(buildQuotaUpstreams(newConfig));
 
         logger.info('Config reloaded successfully');
       } catch (err) {
