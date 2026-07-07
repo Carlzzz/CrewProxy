@@ -1,4 +1,5 @@
 import { logger } from './logger';
+import type { TokenUsageTracker } from './tokenUsageTracker';
 
 export type QuotaStatus = 'ok' | 'expired' | 'not_configured' | 'error';
 
@@ -12,6 +13,7 @@ export interface CredentialQuota {
   weekly?: QuotaTierInfo;
   status: QuotaStatus;
   error?: string;
+  estimated?: boolean;
   queriedAt: number;
 }
 
@@ -20,6 +22,13 @@ export interface QuotaCredentialRef {
   credentialId: string;
   apiKey: string;
   baseURL: string;
+}
+
+export interface QuotaUpstreamRef {
+  upstreamId: string;
+  quotaMode: 'fetch' | 'estimated';
+  quotaLimits?: { fiveHourTokens?: number; weeklyTokens?: number };
+  credentials: QuotaCredentialRef[];
 }
 
 const DEFAULT_INTERVAL_MS = 60_000;
@@ -130,21 +139,23 @@ async function queryMinimax(ref: QuotaCredentialRef, fetchImpl: typeof fetch): P
 }
 
 export class QuotaFetcher {
-  private refs: QuotaCredentialRef[] = [];
+  private upstreams: QuotaUpstreamRef[] = [];
   private snapshot = new Map<string, CredentialQuota>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private intervalMs: number;
   private fetchImpl: typeof fetch;
   private now: () => number;
+  private tokenUsageTracker?: TokenUsageTracker;
 
-  constructor(opts: { fetchImpl?: typeof fetch; intervalMs?: number; now?: () => number } = {}) {
+  constructor(opts: { fetchImpl?: typeof fetch; intervalMs?: number; now?: () => number; tokenUsageTracker?: TokenUsageTracker } = {}) {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.now = opts.now ?? Date.now;
+    this.tokenUsageTracker = opts.tokenUsageTracker;
   }
 
-  reload(refs: QuotaCredentialRef[]): void {
-    this.refs = refs;
+  reload(upstreams: QuotaUpstreamRef[]): void {
+    this.upstreams = upstreams;
   }
 
   start(): void {
@@ -159,31 +170,55 @@ export class QuotaFetcher {
 
   /** Refresh once; exposed for tests so they don't need real timers. */
   async refreshOnce(): Promise<void> {
-    await Promise.all(this.refs.map(async (ref) => {
-      const key = `${ref.upstreamId}\0${ref.credentialId}`;
-      const provider = detectQuotaProvider(ref.baseURL);
-      if (!provider) { this.snapshot.set(key, { status: 'not_configured', queriedAt: this.now() }); return; }
-      try {
-        const result = provider === 'glm' ? await queryGlm(ref, this.fetchImpl) : await queryMinimax(ref, this.fetchImpl);
-        if (result.status === 'error') {
+    await Promise.all(this.upstreams.map(async (u) => {
+      if (u.quotaMode === 'estimated') {
+        const quota = this.buildEstimatedQuota(u);
+        for (const cred of u.credentials) {
+          this.snapshot.set(`${u.upstreamId}\0${cred.credentialId}`, { ...quota });
+        }
+        return;
+      }
+      // fetch 模式：对每个 credential 调官方查询（Plan 1 既有逻辑）
+      await Promise.all(u.credentials.map(async (ref) => {
+        const key = `${u.upstreamId}\0${ref.credentialId}`;
+        const provider = detectQuotaProvider(ref.baseURL);
+        if (!provider) { this.snapshot.set(key, { status: 'not_configured', queriedAt: this.now() }); return; }
+        try {
+          const result = provider === 'glm' ? await queryGlm(ref, this.fetchImpl) : await queryMinimax(ref, this.fetchImpl);
+          if (result.status === 'error') {
+            const prior = this.snapshot.get(key);
+            if (prior) {
+              if (prior.fiveHour && !result.fiveHour) result.fiveHour = prior.fiveHour;
+              if (prior.weekly && !result.weekly) result.weekly = prior.weekly;
+            }
+          }
+          this.snapshot.set(key, result);
+        } catch (err) {
+          logger.error(`[quota] query failed for ${key}:`, err);
+          const result: CredentialQuota = { status: 'error', error: String((err as Error)?.message ?? err), queriedAt: this.now() };
           const prior = this.snapshot.get(key);
           if (prior) {
             if (prior.fiveHour && !result.fiveHour) result.fiveHour = prior.fiveHour;
             if (prior.weekly && !result.weekly) result.weekly = prior.weekly;
           }
+          this.snapshot.set(key, result);
         }
-        this.snapshot.set(key, result);
-      } catch (err) {
-        logger.error(`[quota] query failed for ${key}:`, err);
-        const result: CredentialQuota = { status: 'error', error: String((err as Error)?.message ?? err), queriedAt: this.now() };
-        const prior = this.snapshot.get(key);
-        if (prior) {
-          if (prior.fiveHour && !result.fiveHour) result.fiveHour = prior.fiveHour;
-          if (prior.weekly && !result.weekly) result.weekly = prior.weekly;
-        }
-        this.snapshot.set(key, result);
-      }
+      }));
     }));
+  }
+
+  private buildEstimatedQuota(u: QuotaUpstreamRef): CredentialQuota {
+    const out: CredentialQuota = { status: 'ok', estimated: true, queriedAt: this.now() };
+    const usage = this.tokenUsageTracker?.getUsage(u.upstreamId) ?? { fiveHourTokens: 0, weeklyTokens: 0 };
+    const fhLimit = u.quotaLimits?.fiveHourTokens;
+    const wLimit = u.quotaLimits?.weeklyTokens;
+    if (typeof fhLimit === 'number' && fhLimit > 0) {
+      out.fiveHour = { usedPct: usage.fiveHourTokens / fhLimit * 100, resetsAt: null };
+    }
+    if (typeof wLimit === 'number' && wLimit > 0) {
+      out.weekly = { usedPct: usage.weeklyTokens / wLimit * 100, resetsAt: null };
+    }
+    return out;
   }
 
   getSnapshot(): Map<string, CredentialQuota> {
