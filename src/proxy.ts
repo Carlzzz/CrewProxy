@@ -6,6 +6,7 @@ import { classify429, parseQuotaResetEpochMs } from './codePlanQuota';
 import { buildAnthropicMessagesURL } from './formatTransform';
 import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
 import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow } from './contextBudget';
+import { buildMetricsPayload } from './metricsPayload';
 
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
@@ -1166,6 +1167,23 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           }
         }
         sendJSONResponse(res, 200, { pools });
+        return;
+      }
+
+      if (method === 'GET' && pathname === '/metrics') {
+        // Auth aligned with /models (NOT the unauthenticated /pool-status).
+        const clientApiKey = extractClientApiKey(req);
+        if (!clientApiKey) {
+          sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
+          return;
+        }
+        const authResult = await authenticateRequest(clientApiKey);
+        if (!authResult) {
+          sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+          return;
+        }
+
+        sendJSONResponse(res, 200, buildMetricsPayload(ctx));
         return;
       }
 
