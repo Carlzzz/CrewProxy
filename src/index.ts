@@ -1,7 +1,6 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import { config as dotenvConfig } from 'dotenv';
-import { loadConfig, parseProxyConfigObject, buildUpstreamsByIdMap, ProxyConfig, UpstreamConfig } from './config';
+import { loadConfig, parseProxyConfigObject, buildUpstreamsByIdMap, ProxyConfig, UpstreamConfig, resolveConfigFilePath } from './config';
 import { createProxyServer } from './proxy';
 import { CodePlanPoolManager } from './codePlanPool';
 import { MetricsCollector } from './metricsCollector';
@@ -93,11 +92,7 @@ server.listen(port, host, () => {
   logger.info(`Upstreams: ${upstreamCount} named${hasDefault ? ' + default' : ''}${routeCount > 0 ? `, ${routeCount} model routes` : ''}`);
 });
 
-const configFilePath = configPathArg
-  ? path.resolve(configPathArg)
-  : process.env.WOICLAW_PROXY_CONFIG
-    ? path.resolve(process.env.WOICLAW_PROXY_CONFIG)
-    : path.resolve('proxy-config.json');
+const configFilePath = resolveConfigFilePath(configPathArg);
 
 if (fs.existsSync(configFilePath)) {
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;

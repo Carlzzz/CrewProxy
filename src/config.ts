@@ -323,3 +323,16 @@ export function resolveUpstreamFromModel(
     upstreamRouteId: "__default__",
   };
 }
+
+export function resolveConfigFilePath(configPathArg?: string): string {
+  if (configPathArg !== undefined && configPathArg !== "") {
+    return path.isAbsolute(configPathArg)
+      ? configPathArg
+      : path.resolve(process.cwd(), configPathArg);
+  }
+  if (process.env.WOICLAW_PROXY_CONFIG !== undefined && process.env.WOICLAW_PROXY_CONFIG !== "") {
+    const envPath = process.env.WOICLAW_PROXY_CONFIG;
+    return path.isAbsolute(envPath) ? envPath : path.resolve(process.cwd(), envPath);
+  }
+  return path.join(process.cwd(), "proxy-config.json");
+}
