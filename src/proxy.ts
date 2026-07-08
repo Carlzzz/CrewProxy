@@ -7,6 +7,7 @@ import { buildAnthropicMessagesURL } from './formatTransform';
 import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
 import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow } from './contextBudget';
 import { buildMetricsPayload } from './metricsPayload';
+import { handleAdminConfigRequest } from './configAdmin';
 
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
@@ -1185,6 +1186,24 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
         }
 
         sendJSONResponse(res, 200, buildMetricsPayload(ctx));
+        return;
+      }
+
+      if (pathname.startsWith('/admin/config')) {
+        // Auth aligned with /models and /metrics (NOT the unauthenticated /pool-status).
+        // WOICLAW_AUTH_BYPASS still works via authenticateRequest's bypass branch.
+        const clientApiKey = extractClientApiKey(req);
+        if (!clientApiKey) {
+          sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
+          return;
+        }
+        const authResult = await authenticateRequest(clientApiKey);
+        if (!authResult) {
+          sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+          return;
+        }
+
+        await handleAdminConfigRequest(req, res, ctx);
         return;
       }
 
