@@ -34,7 +34,6 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 const fs = __importStar(require("fs"));
-const path = __importStar(require("path"));
 const dotenv_1 = require("dotenv");
 const config_1 = require("./config");
 const proxy_1 = require("./proxy");
@@ -118,11 +117,7 @@ server.listen(port, host, () => {
     const routeCount = ctx.modelRoutesMap.size;
     logger_1.logger.info(`Upstreams: ${upstreamCount} named${hasDefault ? ' + default' : ''}${routeCount > 0 ? `, ${routeCount} model routes` : ''}`);
 });
-const configFilePath = configPathArg
-    ? path.resolve(configPathArg)
-    : process.env.WOICLAW_PROXY_CONFIG
-        ? path.resolve(process.env.WOICLAW_PROXY_CONFIG)
-        : path.resolve('proxy-config.json');
+const configFilePath = (0, config_1.resolveConfigFilePath)(configPathArg);
 if (fs.existsSync(configFilePath)) {
     let debounceTimer = null;
     fs.watch(configFilePath, () => {

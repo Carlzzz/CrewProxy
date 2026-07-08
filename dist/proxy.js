@@ -45,6 +45,7 @@ const formatTransform_1 = require("./formatTransform");
 const usageLogger_1 = require("./usageLogger");
 const contextBudget_1 = require("./contextBudget");
 const metricsPayload_1 = require("./metricsPayload");
+const configAdmin_1 = require("./configAdmin");
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
 /** Small randomised pause before retrying a different credential. Prevents
@@ -1104,6 +1105,22 @@ function createProxyServer(ctx) {
                     return;
                 }
                 sendJSONResponse(res, 200, (0, metricsPayload_1.buildMetricsPayload)(ctx));
+                return;
+            }
+            if (pathname.startsWith('/admin/config')) {
+                // Auth aligned with /models and /metrics (NOT the unauthenticated /pool-status).
+                // WOICLAW_AUTH_BYPASS still works via authenticateRequest's bypass branch.
+                const clientApiKey = extractClientApiKey(req);
+                if (!clientApiKey) {
+                    sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
+                    return;
+                }
+                const authResult = await authenticateRequest(clientApiKey);
+                if (!authResult) {
+                    sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+                    return;
+                }
+                await (0, configAdmin_1.handleAdminConfigRequest)(req, res, ctx);
                 return;
             }
             sendErrorResponse(res, 404, `Not found: ${method} ${url}`, 'not_found_error');

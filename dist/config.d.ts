@@ -55,3 +55,4 @@ export declare function parseProxyConfigObject(raw: unknown): ProxyConfig;
 export declare function normalizeModelRouteTarget(v: string | ModelRouteTarget): ModelRouteTarget;
 export declare function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext;
 export declare function resolveUpstreamFromModel(modelStr: string, upstreamsByIdMap: Map<string, UpstreamConfig>, defaultUpstream: UpstreamConfig | undefined, modelRoutesMap?: Map<string, ModelRouteTarget>): ResolvedUpstream | null;
+export declare function resolveConfigFilePath(configPathArg?: string): string;

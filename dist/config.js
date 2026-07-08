@@ -9,6 +9,7 @@ exports.parseProxyConfigObject = parseProxyConfigObject;
 exports.normalizeModelRouteTarget = normalizeModelRouteTarget;
 exports.buildUpstreamsByIdMap = buildUpstreamsByIdMap;
 exports.resolveUpstreamFromModel = resolveUpstreamFromModel;
+exports.resolveConfigFilePath = resolveConfigFilePath;
 const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const logger_1 = require("./logger");
@@ -251,4 +252,16 @@ function resolveUpstreamFromModel(modelStr, upstreamsByIdMap, defaultUpstream, m
         modelId,
         upstreamRouteId: "__default__",
     };
+}
+function resolveConfigFilePath(configPathArg) {
+    if (configPathArg !== undefined && configPathArg !== "") {
+        return path_1.default.isAbsolute(configPathArg)
+            ? configPathArg
+            : path_1.default.resolve(process.cwd(), configPathArg);
+    }
+    if (process.env.WOICLAW_PROXY_CONFIG !== undefined && process.env.WOICLAW_PROXY_CONFIG !== "") {
+        const envPath = process.env.WOICLAW_PROXY_CONFIG;
+        return path_1.default.isAbsolute(envPath) ? envPath : path_1.default.resolve(process.cwd(), envPath);
+    }
+    return path_1.default.join(process.cwd(), "proxy-config.json");
 }
