@@ -11,4 +11,3 @@ Thumbs.db
 *.swp
 
 # Local proxy config may contain real API keys — never commit
-proxy-config.json
