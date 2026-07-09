@@ -30,12 +30,13 @@ const DEFAULT_QUOTA_EXHAUSTION_PCT = 100;
 export type CooldownReason = 'quota' | 'rate_limit' | 'network';
 
 /** Serialized cooldown: keyed by `${upstreamKey}\0${credentialId}`. */
-export type CooldownSnapshot = Record<string, { until: number; reason: CooldownReason }>;
+export type CooldownSnapshot = Record<string, { until: number; reason: CooldownReason; apiKey?: string }>;
 
 export class CodePlanPoolManager {
   private pool: Map<string, CodePlanCredential[]> = new Map();
   private cooldowns: Map<string, number> = new Map();      // key → until-epoch-ms
   private cooldownReasons: Map<string, CooldownReason> = new Map();
+  private cooldownApiKeys: Map<string, string> = new Map(); // key → apiKey active when cooldown was set (detect rotation)
   private roundRobin: Map<string, number> = new Map();
   private inFlight: Map<string, number> = new Map();       // key → active-request-count
   // Sliding window: key → sorted array of epoch-ms timestamps (last 1h)
@@ -65,17 +66,38 @@ export class CodePlanPoolManager {
     this.pool.clear();
     this.roundRobin.clear();
 
+    // A cooldown belongs to a specific apiKey (the one that was active when
+    // it was set). When a credential's apiKey is rotated — e.g. replacing an
+    // exhausted key with a fresh one — the old cooldown (quota exhaustion,
+    // rate limit, …) no longer applies and must not keep the new key out of
+    // rotation. Drop it and let the new key prove itself.
+    const clearIfRotated = (upstreamKey: string, cred: CodePlanCredential) => {
+      const ck = this.cooldownKey(upstreamKey, cred.id);
+      const cooledKey = this.cooldownApiKeys.get(ck);
+      if (cooledKey && cred.apiKey && cooledKey !== cred.apiKey) {
+        this.cooldowns.delete(ck);
+        this.cooldownReasons.delete(ck);
+        this.cooldownApiKeys.delete(ck);
+        this.inFlight.delete(ck);
+        logger.info(`[codePlan] cleared cooldown for ${upstreamKey}/${cred.id}: apiKey rotated`);
+      }
+    };
+
     const upstreams = config.upstreamsById ?? {};
     for (const [upstreamKey, upstream] of Object.entries(upstreams)) {
       if (!upstream.codePlanCredentials || upstream.codePlanCredentials.length === 0) {
         continue;
       }
-      this.pool.set(upstreamKey, upstream.codePlanCredentials.filter(c => c.enabled));
+      const enabled = upstream.codePlanCredentials.filter(c => c.enabled);
+      this.pool.set(upstreamKey, enabled);
+      for (const c of enabled) clearIfRotated(upstreamKey, c);
     }
 
     if (config.defaultUpstream?.codePlanCredentials) {
       const defaultKey = '__default__';
-      this.pool.set(defaultKey, config.defaultUpstream.codePlanCredentials.filter(c => c.enabled));
+      const enabled = config.defaultUpstream.codePlanCredentials.filter(c => c.enabled);
+      this.pool.set(defaultKey, enabled);
+      for (const c of enabled) clearIfRotated(defaultKey, c);
     }
 
     for (const [key] of this.pool) {
@@ -85,6 +107,7 @@ export class CodePlanPoolManager {
     }
 
     this.cleanupStaleCooldowns();
+    this.store?.scheduleSave(this.dumpCooldowns());
   }
 
   pickOrFallback(upstreamKey: string, sessionId?: string): CodePlanPickResult {
@@ -114,18 +137,32 @@ export class CodePlanPoolManager {
         return { credentialId: null, apiKey: '', upstreamKey };
       }
     } else if (sessionId) {
-      // Hash to slot on the FULL list, then probe for first available
+      // Hash to slot on the FULL list, then probe for first available — this
+      // is the sticky slot (keeps a session on one key for prompt-cache
+      // locality).
       const startSlot = this.sessionIdToCodePlanSlot(sessionId, credentials.length);
-      let found = -1;
+      let stickyIdx = -1;
       for (let probe = 0; probe < credentials.length; probe++) {
         const idx = (startSlot + probe) % credentials.length;
-        if (availableIndices.includes(idx)) {
-          found = idx;
-          break;
-        }
+        if (availableIndices.includes(idx)) { stickyIdx = idx; break; }
       }
-      // Should always find one since availableIndices.length > 0
-      selectedIdx = found >= 0 ? found : availableIndices[0];
+      if (stickyIdx < 0) {
+        selectedIdx = availableIndices[0];
+      } else {
+        // Sticky *unless* that slot is clearly more loaded than the idlest
+        // peer — a busy sticky slot would just pile on and invite a 429.
+        // Slack=1: a tie or +1 keeps stickiness; a slot running ≥2 more
+        // in-flight than the idlest available key yields to load balancing.
+        const stickyLoad = this.inFlight.get(this.inFlightKey(upstreamKey, credentials[stickyIdx].id)) ?? 0;
+        let minLoad = Infinity;
+        for (const idx of availableIndices) {
+          const v = this.inFlight.get(this.inFlightKey(upstreamKey, credentials[idx].id)) ?? 0;
+          if (v < minLoad) minLoad = v;
+        }
+        selectedIdx = stickyLoad <= minLoad + 1
+          ? stickyIdx
+          : this.pickLowestInFlight(upstreamKey, credentials, availableIndices);
+      }
     } else {
       // Pick the available credential with the LOWEST in-flight count; break
       // ties by round-robin so that when in-flight is uniformly 0 (the common
@@ -165,6 +202,10 @@ export class CodePlanPoolManager {
     const key = this.cooldownKey(upstreamKey, credentialId);
     this.cooldowns.set(key, Date.now() + cooldownMs);
     this.cooldownReasons.set(key, reason);
+    // Remember which apiKey this cooldown belongs to, so a later key rotation
+    // (reconcileFromConfig) can invalidate it.
+    const apiKey = this.pool.get(upstreamKey)?.find(c => c.id === credentialId)?.apiKey;
+    if (apiKey) this.cooldownApiKeys.set(key, apiKey);
     logger.verbose(`[codePlan] cooldown set for ${upstreamKey}/${credentialId}: ${cooldownMs}ms (reason=${reason})`);
     this.store?.scheduleSave(this.dumpCooldowns());
   }
@@ -193,6 +234,12 @@ export class CodePlanPoolManager {
 
       // Only steer on fresh, successful quota reads — never on stale errors.
       if (q.status !== 'ok') continue;
+      // Estimated quota is a guess (TokenUsageTracker ÷ a configured limit the
+      // operator typed in). Taking a key out of rotation for 30 min on a guess
+      // causes false "both pools cooling" states and funnels all traffic onto
+      // the other key. Only real fetched quota should drive proactive cooldowns;
+      // estimated-mode keys rely on the reactive 429 path instead.
+      if (q.estimated) continue;
       const tiers = [q.fiveHour, q.weekly].filter((t): t is NonNullable<typeof t> => !!t);
       if (tiers.length === 0) continue;
 
@@ -288,6 +335,7 @@ export class CodePlanPoolManager {
       if (now > expiry) {
         this.cooldowns.delete(key);
         this.cooldownReasons.delete(key);
+        this.cooldownApiKeys.delete(key);
       }
     }
   }
@@ -378,7 +426,8 @@ export class CodePlanPoolManager {
   dumpCooldowns(): CooldownSnapshot {
     const out: CooldownSnapshot = {};
     for (const [key, until] of this.cooldowns) {
-      out[key] = { until, reason: this.cooldownReasons.get(key) ?? 'rate_limit' };
+      const apiKey = this.cooldownApiKeys.get(key);
+      out[key] = { until, reason: this.cooldownReasons.get(key) ?? 'rate_limit', ...(apiKey ? { apiKey } : {}) };
     }
     return out;
   }
@@ -392,6 +441,7 @@ export class CodePlanPoolManager {
       if (now > entry.until) continue; // expired — discard
       this.cooldowns.set(key, entry.until);
       this.cooldownReasons.set(key, entry.reason ?? 'rate_limit');
+      if (entry.apiKey) this.cooldownApiKeys.set(key, entry.apiKey);
     }
   }
 }

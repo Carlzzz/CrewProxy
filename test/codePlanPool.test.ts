@@ -196,3 +196,125 @@ test('all credentials quota-exhausted falls back to serving (safety valve)', () 
   const r = pool.pickOrFallback('glm');
   assert.ok(r.credentialId, 'must still return a credential when all keys look exhausted');
 });
+
+// ── estimated quota must NOT drive proactive cooldowns (Fix 1) ──
+
+test('applyQuotaSnapshot ignores estimated quota (guess) for proactive cooldown', () => {
+  // Estimated quota is TokenUsageTracker ÷ an operator-typed limit — a guess.
+  // Taking a key out of rotation for 30 min on a guess causes false "both pools
+  // cooling" states. Only real fetched quota should steer; estimated relies on
+  // the reactive 429 path.
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  const m = new Map<string, CredentialQuota>([
+    ['glm\0glm-key1', { status: 'ok', estimated: true, fiveHour: { usedPct: 100, resetsAt: null }, queriedAt: Date.now() }],
+    ['glm\0glm-key2', { status: 'ok', estimated: true, fiveHour: { usedPct: 100, resetsAt: null }, queriedAt: Date.now() }],
+  ]);
+  pool.applyQuotaSnapshot(m);
+  for (const c of pool.getPoolStatus('glm')) {
+    assert.equal(c.inCooldown, false, `estimated quota must not cool ${c.credentialId}`);
+  }
+});
+
+test('applyQuotaSnapshot still steers on real (non-estimated) quota at 100%', () => {
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  pool.applyQuotaSnapshot(quotaSnap([['glm-key1', 100]])); // no estimated flag → real
+  assert.equal(pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, true);
+});
+
+// ── key rotation clears stale cooldown (Fix 2) ──
+
+test('hot-reload: rotating a credential apiKey clears its stale cooldown', () => {
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool()); // glm-key1.apiKey = 'k1'
+  pool.markCooldown('glm', 'glm-key1', 60_000, 'quota');
+  assert.equal(pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, true);
+
+  // Operator swaps the exhausted key for a fresh one (same credentialId).
+  const rotated: ProxyConfig = {
+    upstreamsById: {
+      glm: {
+        baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'x', model: 'glm-5.2',
+        codePlanCredentials: [
+          { id: 'glm-key1', apiKey: 'k1-rotated', weight: 1, enabled: true },
+          { id: 'glm-key2', apiKey: 'k2', weight: 1, enabled: true },
+        ],
+      },
+    },
+  };
+  pool.reconcileFromConfig(rotated);
+  assert.equal(pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, false,
+    'rotated key must not inherit the old key\'s cooldown');
+});
+
+test('restart: persisted cooldown of an old key is cleared after rotation', () => {
+  const f = path.join(os.tmpdir(), `cd-rot-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+  const store1 = new JsonStateStore(f);
+  const a = new CodePlanPoolManager({ store: store1 });
+  a.reconcileFromConfig(configWithPool()); // glm-key1.apiKey = 'k1'
+  a.markCooldown('glm', 'glm-key1', 60_000, 'quota');
+  store1.flushSync();
+
+  // Restart with a rotated key on the same credentialId.
+  const rotated: ProxyConfig = {
+    upstreamsById: {
+      glm: {
+        baseURL: 'https://open.bigmodel.cn/api/paas/v4', apiKey: 'x', model: 'glm-5.2',
+        codePlanCredentials: [{ id: 'glm-key1', apiKey: 'k1-rotated', weight: 1, enabled: true }],
+      },
+    },
+  };
+  const store2 = new JsonStateStore(f);
+  const b = new CodePlanPoolManager({ store: store2 });
+  b.reconcileFromConfig(rotated);
+  assert.equal(b.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, false,
+    'persisted cooldown of the old key must be cleared on restart after rotation');
+});
+
+test('restart: same apiKey keeps its cooldown (no false clear)', () => {
+  const f = path.join(os.tmpdir(), `cd-keep-${process.pid}-${Math.random().toString(36).slice(2)}.json`);
+  const store1 = new JsonStateStore(f);
+  const a = new CodePlanPoolManager({ store: store1 });
+  a.reconcileFromConfig(configWithPool());
+  a.markCooldown('glm', 'glm-key1', 60_000, 'quota');
+  store1.flushSync();
+  const store2 = new JsonStateStore(f);
+  const b = new CodePlanPoolManager({ store: store2 });
+  b.reconcileFromConfig(configWithPool()); // same apiKey 'k1'
+  assert.equal(b.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, true);
+});
+
+// ── session-sticky load awareness (Fix 4) ──
+
+test('session-sticky keeps the hashed slot when load is balanced', () => {
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  // Same session always hashes to the same slot; with no load imbalance it must
+  // stay sticky (for prompt-cache locality).
+  const sid = 'sess-sticky-1';
+  const first = pool.pickOrFallback('glm', sid)!;
+  pool.decInFlight('glm', first.credentialId);
+  for (let i = 0; i < 5; i++) {
+    const r = pool.pickOrFallback('glm', sid)!;
+    assert.equal(r.credentialId, first.credentialId, 'same session must stick to the same key when load is balanced');
+    pool.decInFlight('glm', r.credentialId);
+  }
+});
+
+test('session-sticky yields to the idlest key when its slot is overloaded', () => {
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  const sid = 'sess-load-1';
+  // Two picks from the same session pile onto the sticky slot (in-flight 2);
+  // both stay sticky because slack=1 keeps stickiness at 0-vs-0 and 1-vs-0.
+  const a = pool.pickOrFallback('glm', sid)!;
+  const b = pool.pickOrFallback('glm', sid)!;
+  assert.equal(a.credentialId, b.credentialId, 'first two picks must stay sticky (load within slack)');
+  // Third pick: sticky in-flight=2, peer=0 → 2 > 0+1 → yield to the idle peer.
+  const c = pool.pickOrFallback('glm', sid)!;
+  assert.notEqual(c.credentialId, a.credentialId, 'overloaded sticky slot must yield to the idle peer');
+  pool.decInFlight('glm', a.credentialId);
+  pool.decInFlight('glm', a.credentialId);
+  pool.decInFlight('glm', c.credentialId);
+});

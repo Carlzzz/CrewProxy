@@ -990,64 +990,72 @@ async function handleRequest(
     upstreamResponse = null;
   }
 
-  // **Fix #3 final release**: decrement the last in-flight credential we held.
-  // Note: this happens before stream handling, so in-flight reflects "fetching
-  // headers" rather than "still streaming". That's the signal we want for
-  // picking the *next* credential — full stream-duration tracking would need
-  // handler cooperation and isn't the goal here.
-  if (hasCodePlan && pickedCredentialId !== null && !usedOrdinaryFallback) {
-    ctx.codePlanPool?.decInFlight(codePlanPoolKey, pickedCredentialId);
-  }
-
   // Update usage extra with the final credential that was used
   usageExtra.routing_key = pickedCredentialId ?? upstreamRouteId ?? '__default__';
 
-  // ── Final error check ──
-  if (!upstreamResponse) {
-    recordMetric(false, 0, 0);
-    sendErrorResponse(res, 502, `Upstream request failed: ${lastError?.message || 'unknown'}`, 'api_error');
-    return;
-  }
+  // Release the in-flight slot of the final picked credential AFTER the
+  // response is fully sent. Tracking in-flight across the whole request
+  // (streaming included) is what lets pickOrFallback load-balance and what
+  // /pool-status reports as real concurrent load — releasing at header time
+  // left it permanently ~0 and defeated both. try/finally guarantees the
+  // release runs on every exit path, including a stream handler throw, so the
+  // slot can never leak.
+  const releasePick = (): void => {
+    if (hasCodePlan && pickedCredentialId !== null && !usedOrdinaryFallback) {
+      ctx.codePlanPool?.decInFlight(codePlanPoolKey, pickedCredentialId);
+    }
+  };
 
-  if (!upstreamResponse.ok) {
-    let errText = '';
-    try { errText = await upstreamResponse.clone().text(); } catch {}
-    recordMetric(false, 0, 0);
-    sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
-    return;
-  }
-  if (parsedBody.stream) {
-    await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric);
-    return;
-  }
-
-  // ─── Non-stream response: pass Anthropic response directly ───
-  let anthropicResp: any;
   try {
-    anthropicResp = await upstreamResponse.json();
-  } catch {
-    recordMetric(false, 0, 0);
-    sendErrorResponse(res, 502, 'Failed to parse upstream response', 'api_error');
-    return;
+    // ── Final error check ──
+    if (!upstreamResponse) {
+      recordMetric(false, 0, 0);
+      sendErrorResponse(res, 502, `Upstream request failed: ${lastError?.message || 'unknown'}`, 'api_error');
+      return;
+    }
+
+    if (!upstreamResponse.ok) {
+      let errText = '';
+      try { errText = await upstreamResponse.clone().text(); } catch {}
+      recordMetric(false, 0, 0);
+      sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
+      return;
+    }
+    if (parsedBody.stream) {
+      await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric);
+      return;
+    }
+
+    // ─── Non-stream response: pass Anthropic response directly ───
+    let anthropicResp: any;
+    try {
+      anthropicResp = await upstreamResponse.json();
+    } catch {
+      recordMetric(false, 0, 0);
+      sendErrorResponse(res, 502, 'Failed to parse upstream response', 'api_error');
+      return;
+    }
+
+    const inputContent = buildTrimmedInputContentForUsageLog(upstreamRequestBody);
+    const outputContent = extractOutputContentFromAnthropicResponse(anthropicResp);
+    const respUsage = anthropicResp.usage || { input_tokens: 0, output_tokens: 0 };
+    // Some providers use OpenAI-compat field names (prompt_tokens / completion_tokens)
+    const inputTokens = respUsage.input_tokens ?? respUsage.prompt_tokens ?? 0;
+    const outputTokens = respUsage.output_tokens ?? respUsage.completion_tokens ?? 0;
+
+    appendUsageLog(clientId, effectiveModel, startTime, inputTokens, outputTokens, {
+      ...usageExtra,
+      input_cached_token: extractCachedInputTokensFromUsage(anthropicResp.usage),
+      input_content: inputContent,
+      output_content: outputContent,
+      response_size: JSON.stringify(anthropicResp).length,
+    } as UsageLogExtra);
+
+    recordMetric(true, inputTokens, outputTokens);
+    sendJSONResponse(res, 200, anthropicResp);
+  } finally {
+    releasePick();
   }
-
-  const inputContent = buildTrimmedInputContentForUsageLog(upstreamRequestBody);
-  const outputContent = extractOutputContentFromAnthropicResponse(anthropicResp);
-  const respUsage = anthropicResp.usage || { input_tokens: 0, output_tokens: 0 };
-  // Some providers use OpenAI-compat field names (prompt_tokens / completion_tokens)
-  const inputTokens = respUsage.input_tokens ?? respUsage.prompt_tokens ?? 0;
-  const outputTokens = respUsage.output_tokens ?? respUsage.completion_tokens ?? 0;
-
-  appendUsageLog(clientId, effectiveModel, startTime, inputTokens, outputTokens, {
-    ...usageExtra,
-    input_cached_token: extractCachedInputTokensFromUsage(anthropicResp.usage),
-    input_content: inputContent,
-    output_content: outputContent,
-    response_size: JSON.stringify(anthropicResp).length,
-  } as UsageLogExtra);
-
-  recordMetric(true, inputTokens, outputTokens);
-  sendJSONResponse(res, 200, anthropicResp);
 }
 
 // ─── Server factory ───
@@ -1144,7 +1152,7 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           sendJSONResponse(res, 200, { pools: {} });
           return;
         }
-        const pools: Record<string, { credentials: Array<{ id: string; model?: string; inCooldown: boolean; cooldownUntil?: number; requestsLast1h: number; inFlight: number }> }> = {};
+        const pools: Record<string, { credentials: Array<{ id: string; model?: string; inCooldown: boolean; cooldownReason?: string; cooldownUntil?: number; requestsLast1h: number; inFlight: number }> }> = {};
         const allKeys = new Set<string>();
         for (const [upstreamId] of ctx.upstreamsByIdMap) allKeys.add(upstreamId);
         allKeys.add('__default__');
@@ -1155,6 +1163,7 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
             credentials: status.map(c => ({
               id: c.credentialId,
               inCooldown: c.inCooldown,
+              cooldownReason: c.cooldownReason,
               cooldownUntil: c.cooldownUntil,
               requestsLast1h: c.requestsLast1h,
               inFlight: ctx.codePlanPool!.getInFlight(key, c.credentialId),
