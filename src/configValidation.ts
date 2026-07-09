@@ -63,8 +63,24 @@ function validateUpstream(base: string, u: UpstreamConfig): { errors: Validation
   const errs: ValidationIssue[] = [];
   const warns: ValidationIssue[] = [];
   if (!isUrl(u.baseURL)) errs.push({ path: `${base}.baseURL`, message: 'baseURL 必须是合法 http(s) URL' });
-  if (!u.apiKey) errs.push({ path: `${base}.apiKey`, message: 'apiKey 必填' });
   if (!u.model) errs.push({ path: `${base}.model`, message: 'model 必填' });
+
+  // Validate code-plan credentials first so we know whether any pooled key
+  // exists. The upstream-level apiKey is only required when there is no
+  // usable coding-plan pool: the proxy serves code-plan requests from
+  // codePlanCredentials[].apiKey and treats an empty upstream apiKey as
+  // "no ordinary fallback" (proxy.ts), so a code-plan-only upstream may
+  // legitimately leave apiKey empty.
+  const codePlanCreds = u.codePlanCredentials ?? [];
+  const hasPooledKey = codePlanCreds.some((c) => c.apiKey);
+  if (!u.apiKey) {
+    if (hasPooledKey) {
+      warns.push({ path: `${base}.apiKey`, message: '上游 apiKey 留空，将仅使用 codePlanCredentials 的凭据（无普通回退）' });
+    } else {
+      errs.push({ path: `${base}.apiKey`, message: 'apiKey 必填，或至少配置一个 codePlanCredential 的 apiKey' });
+    }
+  }
+
   // provider is free-form in the proxy (only affects request transformation;
   // unknown providers are served via the generic Chat Completions path), so an
   // unrecognized value is a warning, not a hard error. This keeps real configs

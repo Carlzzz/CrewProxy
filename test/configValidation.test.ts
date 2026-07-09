@@ -83,6 +83,35 @@ test('unknown provider is a warning, not an error (proxy is free-form)', () => {
   assert.equal(r.errors.length, 0);
 });
 
+test('code-plan-only upstream may leave upstream apiKey empty', () => {
+  const cfg = {
+    upstreamsById: {
+      glm: baseUpstream({
+        apiKey: '',
+        codePlanCredentials: [
+          { id: 'glm-key1', apiKey: 'pool-k1', weight: 1, enabled: true },
+          { id: 'glm-key2', apiKey: 'pool-k2', weight: 1, enabled: true },
+        ],
+      }),
+    },
+  } as ProxyConfig;
+  const r = validateResolvedProxyConfig(cfg);
+  assert.equal(r.ok, true);
+  assert.ok(r.warnings.some(w => w.path === 'upstreamsById.glm.apiKey'));
+  assert.equal(r.errors.length, 0);
+});
+
+test('rejects empty upstream apiKey when no codePlanCredential key exists', () => {
+  const cfg = {
+    upstreamsById: {
+      glm: baseUpstream({ apiKey: '', codePlanCredentials: [] }),
+    },
+  } as ProxyConfig;
+  const r = validateResolvedProxyConfig(cfg);
+  assert.equal(r.ok, false);
+  assert.ok(r.errors.some(e => e.path === 'upstreamsById.glm.apiKey'));
+});
+
 test('accepts zai and ali providers', () => {
   const cfg = { upstreamsById: {
     zai: baseUpstream({ provider: 'zai' }),
