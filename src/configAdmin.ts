@@ -2,19 +2,22 @@ import fs from 'fs';
 import {
   parseProxyConfigObject,
   resolveConfigFilePath,
-  type ProxyConfig,
   type UpstreamConfig,
-  type CodePlanCredential,
   type ModelRouteTarget,
 } from './config';
 import { logger } from './logger';
-import { redactProxyConfig } from './configRedaction';
+import { maskSecret } from './configRedaction';
 import { validateResolvedProxyConfig, type ValidationResult } from './configValidation';
 
 export type ApiKeyMode = 'keep' | 'replace';
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === 'object';
+}
+
+/** Deep clone via JSON — safe here because proxy-config.json is plain JSON. */
+function cloneJson<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v));
 }
 
 /**
@@ -34,104 +37,164 @@ function resolveSecretField(
   draftVal: unknown,
 ): { key: string; mode: ApiKeyMode } {
   if (!isObject(draftVal)) return { key: cur ?? '', mode: 'keep' };
-  const o = draftVal as Record<string, unknown>;
+  const o = draftVal;
   if (o.apiKeyMode === 'keep') return { key: cur ?? '', mode: 'keep' };
   if (typeof o.apiKey === 'string') return { key: o.apiKey, mode: 'replace' };
   return { key: cur ?? '', mode: 'keep' };
 }
 
-/** Merge a draft (with apiKeyMode) onto current real config, restoring real secrets for 'keep'. */
-export function mergeSecrets(currentReal: ProxyConfig, draft: unknown): ProxyConfig {
-  if (!isObject(draft)) throw new Error('draft must be an object');
-  const d = draft as Record<string, unknown>;
-
-  const mergeUpstream = (id: string, cur: UpstreamConfig | undefined, du: unknown): UpstreamConfig => {
-    if (!isObject(du)) throw new Error(`upstream ${id} must be an object`);
-    const o = du as Record<string, unknown>;
-    const baseURL = String(o.baseURL ?? cur?.baseURL ?? '');
-    const { key } = resolveSecretField(cur?.apiKey, o);
-    const model = String(o.model ?? cur?.model ?? '');
-    const out: UpstreamConfig = { baseURL, apiKey: key, model };
-    if (o.provider !== undefined) out.provider = String(o.provider);
-    if (Array.isArray(o.codePlanCredentials)) {
-      out.codePlanCredentials = (o.codePlanCredentials as unknown[]).map((raw, i) => {
-        const c = isObject(raw) ? raw as Record<string, unknown> : {};
-        const curCred = cur?.codePlanCredentials?.find(x => x.id === String(c.id ?? ''));
-        const ck = resolveSecretField(curCred?.apiKey, c);
-        const cred: CodePlanCredential = {
-          id: String(c.id ?? ''),
-          apiKey: ck.key,
-          model: c.model !== undefined ? String(c.model) : undefined,
-          weight: typeof c.weight === 'number' ? c.weight : (curCred?.weight ?? 1),
-          enabled: c.enabled !== undefined ? c.enabled !== false : (curCred?.enabled ?? true),
-        };
-        return cred;
-      });
-    } else if (cur?.codePlanCredentials) {
-      out.codePlanCredentials = cur.codePlanCredentials;
-    }
-    if (o.quotaLimits !== undefined && isObject(o.quotaLimits)) {
-      const ql = o.quotaLimits as Record<string, unknown>;
-      out.quotaLimits = {};
-      if (typeof ql.fiveHourTokens === 'number') out.quotaLimits.fiveHourTokens = ql.fiveHourTokens;
-      if (typeof ql.weeklyTokens === 'number') out.quotaLimits.weeklyTokens = ql.weeklyTokens;
-    } else if (cur?.quotaLimits) {
-      out.quotaLimits = cur.quotaLimits;
-    }
-    if (o.codePlanBaseURL !== undefined) out.codePlanBaseURL = String(o.codePlanBaseURL);
-    if (o.codePlanAnthropicBaseURL !== undefined) out.codePlanAnthropicBaseURL = String(o.codePlanAnthropicBaseURL);
-    if (o.quotaMode === 'fetch' || o.quotaMode === 'estimated') out.quotaMode = o.quotaMode;
-    return out;
-  };
-
-  const merged: ProxyConfig = {};
-  if (typeof d.port === 'number') merged.port = d.port;
-  if (typeof d.host === 'string') merged.host = d.host;
-
-  if (d.defaultUpstream !== undefined) {
-    merged.defaultUpstream = mergeUpstream('__default__', currentReal.defaultUpstream, d.defaultUpstream);
-  } else if (currentReal.defaultUpstream) {
-    merged.defaultUpstream = currentReal.defaultUpstream;
-  }
-
-  if (d.upstreamsById !== undefined) {
-    if (!isObject(d.upstreamsById)) throw new Error('upstreamsById must be an object');
-    const curMap = currentReal.upstreamsById ?? {};
-    const out: Record<string, UpstreamConfig> = {};
-    for (const [id, du] of Object.entries(d.upstreamsById as Record<string, unknown>)) {
-      out[id] = mergeUpstream(id, curMap[id], du);
-    }
-    merged.upstreamsById = out;
-  } else if (currentReal.upstreamsById) {
-    merged.upstreamsById = currentReal.upstreamsById;
-  }
-
-  if (d.modelRoutes !== undefined) {
-    if (!isObject(d.modelRoutes)) throw new Error('modelRoutes must be an object');
-    const routes: Record<string, string | ModelRouteTarget> = {};
-    for (const [model, target] of Object.entries(d.modelRoutes as Record<string, unknown>)) {
-      if (target !== null && typeof target === 'object') {
-        const t = target as Record<string, unknown>;
-        routes[model] = { upstream: String(t.upstream), model: t.model !== undefined ? String(t.model) : undefined };
-      } else {
-        routes[model] = String(target);
-      }
-    }
-    merged.modelRoutes = routes;
-  } else if (currentReal.modelRoutes) {
-    merged.modelRoutes = currentReal.modelRoutes;
-  }
-
-  return merged;
+function asString(v: unknown): string | undefined {
+  return typeof v === 'string' ? v : undefined;
 }
 
-function readRealConfig(): ProxyConfig {
+/* ------------------------------------------------------------------ */
+/*  Raw-based merge                                                     */
+/*                                                                     */
+/*  The persisted proxy-config.json is the source of truth. A save      */
+/*  request (draft) only carries the fields the provider page edits;    */
+/*  everything else on disk (port, host, per-upstream quotaMode,        */
+/*  ordinaryFallbackModelMap, codePlanBaseURL, and any future/unknown   */
+/*  fields) MUST survive untouched. We therefore clone the current raw  */
+/*  object and overlay only the draft fields, instead of rebuilding the */
+/*  whole config from a whitelist.                                      */
+/* ------------------------------------------------------------------ */
+
+function mergeCredentialRaw(
+  curCred: unknown,
+  draftCred: unknown,
+): Record<string, unknown> {
+  const base: Record<string, unknown> = isObject(curCred) ? cloneJson(curCred) : {};
+  if (!isObject(draftCred)) return base;
+  const d = draftCred;
+  if (d.id !== undefined) base.id = String(d.id);
+  const { key } = resolveSecretField(asString((curCred as Record<string, unknown> | undefined)?.apiKey), d);
+  base.apiKey = key;
+  if (d.weight !== undefined) base.weight = Number(d.weight);
+  if (d.enabled !== undefined) base.enabled = d.enabled !== false;
+  if (d.model !== undefined) base.model = String(d.model);
+  return base;
+}
+
+function mergeUpstreamRaw(
+  curUp: unknown,
+  draftUp: unknown,
+): Record<string, unknown> {
+  const base: Record<string, unknown> = isObject(curUp) ? cloneJson(curUp) : {};
+  if (!isObject(draftUp)) return base;
+  const d = draftUp;
+  if (d.baseURL !== undefined) base.baseURL = String(d.baseURL);
+  const { key } = resolveSecretField(asString((curUp as Record<string, unknown> | undefined)?.apiKey), d);
+  base.apiKey = key;
+  if (d.model !== undefined) base.model = String(d.model);
+  if (d.provider !== undefined) base.provider = String(d.provider);
+  if (d.quotaLimits !== undefined && isObject(d.quotaLimits)) {
+    base.quotaLimits = cloneJson(d.quotaLimits);
+  }
+  if (Array.isArray(d.codePlanCredentials)) {
+    const curCreds = Array.isArray(base.codePlanCredentials) ? base.codePlanCredentials : [];
+    base.codePlanCredentials = d.codePlanCredentials.map((raw) => {
+      const dc = isObject(raw) ? raw : {};
+      const idStr = String(dc.id ?? '');
+      const curCred = curCreds.find((c) => {
+        const cc = c as Record<string, unknown>;
+        return isObject(cc) && String(cc.id ?? '') === idStr;
+      });
+      return mergeCredentialRaw(curCred, dc);
+    });
+  }
+  // quotaMode / ordinaryFallbackModelMap / codePlanBaseURL /
+  // codePlanAnthropicBaseURL and any unknown field stay in `base` untouched.
+  return base;
+}
+
+export function mergeConfigDraftRaw(rawCurrent: unknown, draft: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = isObject(rawCurrent) ? cloneJson(rawCurrent) : {};
+  if (!isObject(draft)) return out;
+  const d = draft;
+  if (typeof d.port === 'number') out.port = d.port;
+  if (typeof d.host === 'string') out.host = d.host;
+  if (d.defaultUpstream !== undefined) {
+    out.defaultUpstream = mergeUpstreamRaw(out.defaultUpstream, d.defaultUpstream);
+  }
+  if (d.upstreamsById !== undefined && isObject(d.upstreamsById)) {
+    const curMap = isObject(out.upstreamsById)
+      ? (out.upstreamsById as Record<string, unknown>)
+      : {};
+    const result: Record<string, unknown> = {};
+    for (const [id, du] of Object.entries(d.upstreamsById)) {
+      result[id] = mergeUpstreamRaw(curMap[id], du);
+    }
+    out.upstreamsById = result;
+  }
+  if (d.modelRoutes !== undefined && isObject(d.modelRoutes)) {
+    out.modelRoutes = cloneJson(d.modelRoutes);
+  }
+  return out;
+}
+
+/**
+ * Merge a draft (with apiKeyMode) onto the current raw config, restoring real
+ * secrets for 'keep' and preserving every field the draft does not touch.
+ * Kept as an export for backwards compatibility with callers/tests; new code
+ * should call {@link mergeConfigDraftRaw}.
+ */
+export function mergeSecrets(currentReal: unknown, draft: unknown): Record<string, unknown> {
+  return mergeConfigDraftRaw(currentReal, draft);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Raw-based redaction (GET)                                           */
+/* ------------------------------------------------------------------ */
+
+function redactCredentialRaw(c: Record<string, unknown>): Record<string, unknown> {
+  const out = cloneJson(c);
+  const apiKey = out.apiKey;
+  delete out.apiKey;
+  out.hasApiKey = Boolean(apiKey);
+  out.apiKeyMasked = maskSecret(asString(apiKey));
+  return out;
+}
+
+function redactUpstreamRaw(u: Record<string, unknown>): Record<string, unknown> {
+  const out = cloneJson(u);
+  const apiKey = out.apiKey;
+  delete out.apiKey;
+  out.hasApiKey = Boolean(apiKey);
+  out.apiKeyMasked = maskSecret(asString(apiKey));
+  if (Array.isArray(out.codePlanCredentials)) {
+    out.codePlanCredentials = out.codePlanCredentials.map((c) =>
+      isObject(c) ? redactCredentialRaw(c) : c,
+    );
+  }
+  return out;
+}
+
+export function redactRawConfig(raw: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = isObject(raw) ? cloneJson(raw) : {};
+  if (isObject(out.defaultUpstream)) {
+    out.defaultUpstream = redactUpstreamRaw(out.defaultUpstream as Record<string, unknown>);
+  }
+  if (isObject(out.upstreamsById)) {
+    const redacted: Record<string, unknown> = {};
+    for (const [id, u] of Object.entries(out.upstreamsById)) {
+      redacted[id] = isObject(u) ? redactUpstreamRaw(u as Record<string, unknown>) : u;
+    }
+    out.upstreamsById = redacted;
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Disk I/O                                                            */
+/* ------------------------------------------------------------------ */
+
+function readRawConfig(): unknown {
   const fp = resolveConfigFilePath();
   const text = fs.readFileSync(fp, 'utf-8');
-  return parseProxyConfigObject(JSON.parse(text));
+  return JSON.parse(text);
 }
 
-function atomicWriteConfig(merged: ProxyConfig): string {
+function atomicWriteConfig(merged: unknown): string {
   const fp = resolveConfigFilePath();
   const tmp = fp + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf-8');
@@ -166,8 +229,8 @@ export async function handleAdminConfigRequest(
 
   if (method === 'GET' && url === '/admin/config') {
     try {
-      const real = readRealConfig();
-      const redacted = redactProxyConfig(real);
+      const raw = readRawConfig();
+      const redacted = redactRawConfig(raw);
       sendJson(res, 200, {
         configPath: resolveConfigFilePath(),
         defaultUpstream: redacted.defaultUpstream,
@@ -185,9 +248,11 @@ export async function handleAdminConfigRequest(
   if (method === 'POST' && url === '/admin/config/validate') {
     try {
       const body = await readJsonBody(req);
-      const real = readRealConfig();
-      const merged = mergeSecrets(real, body);
-      const result: ValidationResult = validateResolvedProxyConfig(merged);
+      const raw = readRawConfig();
+      const merged = mergeConfigDraftRaw(raw, body);
+      // Validate the resolved shape; validation never touches the disk file.
+      const parsed = parseProxyConfigObject(merged);
+      const result: ValidationResult = validateResolvedProxyConfig(parsed);
       sendJson(res, 200, result);
     } catch (e) {
       logger.error('admin/config/validate failed:', e);
@@ -199,9 +264,12 @@ export async function handleAdminConfigRequest(
   if (method === 'PUT' && url === '/admin/config') {
     try {
       const body = await readJsonBody(req);
-      const real = readRealConfig();
-      const merged = mergeSecrets(real, body);
-      const result = validateResolvedProxyConfig(merged);
+      const raw = readRawConfig();
+      const merged = mergeConfigDraftRaw(raw, body);
+      // Validate the resolved shape before writing; on failure the file is
+      // left byte-for-byte unchanged.
+      const parsed = parseProxyConfigObject(merged);
+      const result = validateResolvedProxyConfig(parsed);
       if (!result.ok) {
         sendJson(res, 400, { ok: false, errors: result.errors, warnings: result.warnings });
         return;

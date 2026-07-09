@@ -267,3 +267,126 @@ test('handleAdminConfigRequest returns 404 for unknown admin path', async () => 
   );
   assert.equal(res.statusCode, 404);
 });
+
+/* ------------------------------------------------------------------ */
+/*  Structure preservation (regression: fields not in the draft must   */
+/*  survive a save — see root-cause analysis of the provider page bug).*/
+/* ------------------------------------------------------------------ */
+
+test('mergeSecrets preserves top-level port and host absent from draft', () => {
+  // The frontend buildDraft() only sends upstreamsById/modelRoutes/defaultUpstream.
+  // port/host must be carried over from the current config, not dropped.
+  const cur = {
+    port: 3456,
+    host: '0.0.0.0',
+    upstreamsById: { glm: { baseURL: 'https://x', apiKey: 'REAL', model: 'glm-5.2', provider: 'glm' } },
+  };
+  const draft = {
+    upstreamsById: { glm: { baseURL: 'https://x', apiKeyMode: 'keep', model: 'glm-5.2', provider: 'glm' } },
+  };
+  const merged = mergeSecrets(cur, draft) as any;
+  assert.equal(merged.port, 3456, 'port must be preserved');
+  assert.equal(merged.host, '0.0.0.0', 'host must be preserved');
+});
+
+test('mergeSecrets preserves upstream quotaMode, ordinaryFallbackModelMap, codePlanBaseURL', () => {
+  const cur = {
+    upstreamsById: {
+      glm: {
+        baseURL: 'https://x', apiKey: 'REAL', model: 'glm-5.2', provider: 'glm',
+        quotaMode: 'estimated',
+        ordinaryFallbackModelMap: { 'claude-3-haiku': 'glm-4.5-air' },
+        codePlanBaseURL: 'https://open.bigmodel.cn/api/paas/v4',
+        quotaLimits: { fiveHourTokens: 160000000, weeklyTokens: 800000000 },
+      },
+    },
+  };
+  const draft = {
+    upstreamsById: {
+      glm: {
+        baseURL: 'https://x', apiKeyMode: 'keep', model: 'glm-5.2', provider: 'glm',
+        quotaLimits: { fiveHourTokens: 160000000, weeklyTokens: 800000000 },
+      },
+    },
+  };
+  const merged = mergeSecrets(cur, draft) as any;
+  const glm = merged.upstreamsById.glm;
+  assert.equal(glm.quotaMode, 'estimated');
+  assert.deepEqual(glm.ordinaryFallbackModelMap, { 'claude-3-haiku': 'glm-4.5-air' });
+  assert.equal(glm.codePlanBaseURL, 'https://open.bigmodel.cn/api/paas/v4');
+  assert.equal(glm.apiKey, 'REAL', 'keep mode must still restore the real key');
+});
+
+test('PUT /admin/config preserves port, host, and upstream quotaMode on disk', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crewproxy-'));
+  const fp = path.join(dir, 'proxy-config.json');
+  fs.writeFileSync(fp, JSON.stringify({
+    port: 3456,
+    host: '0.0.0.0',
+    upstreamsById: {
+      glm: {
+        baseURL: 'https://open.bigmodel.cn', apiKey: 'sk-secret1234', model: 'glm-5.2', provider: 'glm',
+        quotaMode: 'estimated',
+      },
+    },
+  }));
+  process.env.WOICLAW_PROXY_CONFIG = fp;
+  try {
+    // Exactly what the provider page sends: no port/host/quotaMode.
+    const reqBody = JSON.stringify({
+      upstreamsById: { glm: { baseURL: 'https://open.bigmodel.cn', apiKeyMode: 'keep', model: 'glm-5.2', provider: 'glm' } },
+    });
+    const res = mockRes();
+    await handleAdminConfigRequest(
+      asyncStream(reqBody, 'PUT', '/admin/config') as any,
+      res,
+      { upstreamsByIdMap: new Map(), modelRoutesMap: new Map() },
+    );
+    assert.equal(res.statusCode, 200);
+    const written = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+    assert.equal(written.port, 3456, 'port must be preserved on disk');
+    assert.equal(written.host, '0.0.0.0', 'host must be preserved on disk');
+    assert.equal(written.upstreamsById.glm.quotaMode, 'estimated', 'quotaMode must be preserved on disk');
+    assert.equal(written.upstreamsById.glm.apiKey, 'sk-secret1234');
+    assert.ok(!fs.existsSync(fp + '.tmp'));
+  } finally {
+    delete process.env.WOICLAW_PROXY_CONFIG;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('PUT /admin/config adding a new upstream preserves unrelated existing fields', async () => {
+  // New-provider flow: draft adds "deepseek" while "glm" keeps its extra fields.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crewproxy-'));
+  const fp = path.join(dir, 'proxy-config.json');
+  fs.writeFileSync(fp, JSON.stringify({
+    port: 3456,
+    upstreamsById: {
+      glm: { baseURL: 'https://x', apiKey: 'glm-real', model: 'glm-5.2', provider: 'glm', quotaMode: 'estimated' },
+    },
+  }));
+  process.env.WOICLAW_PROXY_CONFIG = fp;
+  try {
+    const reqBody = JSON.stringify({
+      upstreamsById: {
+        glm: { baseURL: 'https://x', apiKeyMode: 'keep', model: 'glm-5.2', provider: 'glm' },
+        deepseek: { baseURL: 'https://api.deepseek.com', apiKeyMode: 'replace', apiKey: 'ds-new', model: 'deepseek-v4', provider: 'deepseek' },
+      },
+    });
+    const res = mockRes();
+    await handleAdminConfigRequest(
+      asyncStream(reqBody, 'PUT', '/admin/config') as any,
+      res,
+      { upstreamsByIdMap: new Map(), modelRoutesMap: new Map() },
+    );
+    assert.equal(res.statusCode, 200);
+    const written = JSON.parse(fs.readFileSync(fp, 'utf-8'));
+    assert.equal(written.port, 3456);
+    assert.equal(written.upstreamsById.glm.quotaMode, 'estimated');
+    assert.equal(written.upstreamsById.glm.apiKey, 'glm-real');
+    assert.equal(written.upstreamsById.deepseek.apiKey, 'ds-new');
+  } finally {
+    delete process.env.WOICLAW_PROXY_CONFIG;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
