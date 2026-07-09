@@ -41,6 +41,7 @@ const codePlanPool_1 = require("./codePlanPool");
 const metricsCollector_1 = require("./metricsCollector");
 const quotaFetcher_1 = require("./quotaFetcher");
 const tokenUsageTracker_1 = require("./tokenUsageTracker");
+const stateStore_1 = require("./stateStore");
 const logger_1 = require("./logger");
 (0, dotenv_1.config)();
 const configPathArg = process.argv[2];
@@ -53,14 +54,18 @@ catch (err) {
     process.exit(1);
 }
 const ctx = (0, config_1.buildUpstreamsByIdMap)(currentConfig);
-// Initialize Code Plan credential pool
-const codePlanPool = new codePlanPool_1.CodePlanPoolManager();
+// Persisted runtime state (token-usage windows + credential cooldowns) survives restarts
+const STATE_DIR = process.env.WOICLAW_STATE_DIR || './data';
+// Initialize Code Plan credential pool (cooldowns restored before reconcile)
+const cooldownStore = new stateStore_1.JsonStateStore(`${STATE_DIR}/cooldowns.json`);
+const codePlanPool = new codePlanPool_1.CodePlanPoolManager({ store: cooldownStore });
 codePlanPool.reconcileFromConfig(currentConfig);
 ctx.codePlanPool = codePlanPool;
 // Initialize metrics + quota fetcher
 const metrics = new metricsCollector_1.MetricsCollector();
 ctx.metrics = metrics;
-const tokenUsage = new tokenUsageTracker_1.TokenUsageTracker();
+const tokenUsageStore = new stateStore_1.JsonStateStore(`${STATE_DIR}/token-usage.json`);
+const tokenUsage = new tokenUsageTracker_1.TokenUsageTracker({ store: tokenUsageStore });
 ctx.tokenUsage = tokenUsage;
 function buildQuotaUpstreams(cfg) {
     const out = [];
@@ -145,5 +150,11 @@ if (fs.existsSync(configFilePath)) {
     });
     logger_1.logger.info(`Watching config: ${configFilePath}`);
 }
-process.on('SIGTERM', () => { quotaFetcher.stop(); server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { quotaFetcher.stop(); server.close(() => process.exit(0)); });
+function shutdown() {
+    quotaFetcher.stop();
+    tokenUsageStore.flushSync();
+    cooldownStore.flushSync();
+    server.close(() => process.exit(0));
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

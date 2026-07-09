@@ -1,4 +1,5 @@
 import type { ProxyConfig, CodePlanCredential } from './config';
+import type { JsonStateStore } from './stateStore';
 import { logger } from './logger';
 
 export interface CodePlanPickResult {
@@ -22,6 +23,9 @@ export const CODE_PLAN_SHORT_COOLDOWN_MS = 30_000; // 30 s for rate-limit burst
 
 export type CooldownReason = 'quota' | 'rate_limit' | 'network';
 
+/** Serialized cooldown: keyed by `${upstreamKey}\0${credentialId}`. */
+export type CooldownSnapshot = Record<string, { until: number; reason: CooldownReason }>;
+
 export class CodePlanPoolManager {
   private pool: Map<string, CodePlanCredential[]> = new Map();
   private cooldowns: Map<string, number> = new Map();      // key → until-epoch-ms
@@ -32,6 +36,24 @@ export class CodePlanPoolManager {
   private requestLog: Map<string, number[]> = new Map();
   private sweepIntervalMs = 60_000;                         // sweep stale log entries every 1 min
   private lastSweep = Date.now();
+  private store?: JsonStateStore;
+
+  constructor(opts: { store?: JsonStateStore } = {}) {
+    this.store = opts.store;
+    if (this.store) {
+      const snap = this.store.load<CooldownSnapshot>();
+      if (snap) {
+        try {
+          this.restoreCooldowns(snap);
+          if (this.cooldowns.size > 0) {
+            logger.info(`[codePlan] restored ${this.cooldowns.size} active cooldown(s) from persisted state`);
+          }
+        } catch (err) {
+          logger.warn('[codePlan] cooldown restore failed, starting empty:', err);
+        }
+      }
+    }
+  }
 
   reconcileFromConfig(config: ProxyConfig): void {
     this.pool.clear();
@@ -137,6 +159,7 @@ export class CodePlanPoolManager {
     this.cooldowns.set(key, Date.now() + cooldownMs);
     this.cooldownReasons.set(key, reason);
     logger.verbose(`[codePlan] cooldown set for ${upstreamKey}/${credentialId}: ${cooldownMs}ms (reason=${reason})`);
+    this.store?.scheduleSave(this.dumpCooldowns());
   }
 
   // ── private helpers ──
@@ -248,5 +271,28 @@ export class CodePlanPoolManager {
       hash = (hash * 16777619) >>> 0;
     }
     return hash % Math.max(length, 1);
+  }
+
+  // ── Cooldown persistence ──
+
+  /** Serialize active cooldowns to a JSON-friendly snapshot. */
+  dumpCooldowns(): CooldownSnapshot {
+    const out: CooldownSnapshot = {};
+    for (const [key, until] of this.cooldowns) {
+      out[key] = { until, reason: this.cooldownReasons.get(key) ?? 'rate_limit' };
+    }
+    return out;
+  }
+
+  /** Restore cooldowns from a snapshot. Already-expired entries are dropped. */
+  restoreCooldowns(snapshot: CooldownSnapshot): void {
+    if (!snapshot) return;
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(snapshot)) {
+      if (!entry || !Number.isFinite(entry.until)) continue;
+      if (now > entry.until) continue; // expired — discard
+      this.cooldowns.set(key, entry.until);
+      this.cooldownReasons.set(key, entry.reason ?? 'rate_limit');
+    }
   }
 }

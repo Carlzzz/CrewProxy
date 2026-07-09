@@ -7,6 +7,7 @@ import { MetricsCollector } from './metricsCollector';
 import { QuotaFetcher } from './quotaFetcher';
 import type { QuotaUpstreamRef } from './quotaFetcher';
 import { TokenUsageTracker } from './tokenUsageTracker';
+import { JsonStateStore } from './stateStore';
 import { logger } from './logger';
 
 dotenvConfig();
@@ -23,8 +24,12 @@ try {
 
 const ctx = buildUpstreamsByIdMap(currentConfig);
 
-// Initialize Code Plan credential pool
-const codePlanPool = new CodePlanPoolManager();
+// Persisted runtime state (token-usage windows + credential cooldowns) survives restarts
+const STATE_DIR = process.env.WOICLAW_STATE_DIR || './data';
+
+// Initialize Code Plan credential pool (cooldowns restored before reconcile)
+const cooldownStore = new JsonStateStore(`${STATE_DIR}/cooldowns.json`);
+const codePlanPool = new CodePlanPoolManager({ store: cooldownStore });
 codePlanPool.reconcileFromConfig(currentConfig);
 ctx.codePlanPool = codePlanPool;
 
@@ -32,7 +37,8 @@ ctx.codePlanPool = codePlanPool;
 const metrics = new MetricsCollector();
 ctx.metrics = metrics;
 
-const tokenUsage = new TokenUsageTracker();
+const tokenUsageStore = new JsonStateStore(`${STATE_DIR}/token-usage.json`);
+const tokenUsage = new TokenUsageTracker({ store: tokenUsageStore });
 ctx.tokenUsage = tokenUsage;
 
 function buildQuotaUpstreams(cfg: ProxyConfig): QuotaUpstreamRef[] {
@@ -124,5 +130,11 @@ if (fs.existsSync(configFilePath)) {
   logger.info(`Watching config: ${configFilePath}`);
 }
 
-process.on('SIGTERM', () => { quotaFetcher.stop(); server.close(() => process.exit(0)); });
-process.on('SIGINT', () => { quotaFetcher.stop(); server.close(() => process.exit(0)); });
+function shutdown(): void {
+  quotaFetcher.stop();
+  tokenUsageStore.flushSync();
+  cooldownStore.flushSync();
+  server.close(() => process.exit(0));
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);

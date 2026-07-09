@@ -1,4 +1,5 @@
 import { logger } from './logger';
+import type { JsonStateStore } from './stateStore';
 
 export const TOKEN_FIVEHOUR_BUCKET_MS = 60_000;      // 1 min
 export const TOKEN_WEEKLY_BUCKET_MS = 3_600_000;     // 1 hour
@@ -9,20 +10,44 @@ interface WindowLog {
   buckets: Map<number, number>;  // bucketStartMs → token sum
 }
 
+/** Serialized form of one window: bucket-start-ms (as string) → tokens. */
+type WindowSnapshot = Record<string, number>;
+interface UpstreamSnapshot {
+  fiveHour: WindowSnapshot;
+  weekly: WindowSnapshot;
+}
+export type TokenUsageSnapshot = Record<string, UpstreamSnapshot>;
+
 /**
  * Per-upstream rolling-window token accumulator. Two independent windows:
  *  - 5h, 1-min buckets (300 buckets max)
  *  - 7d, 1-hour buckets (168 buckets max)
  *
- * Pure in-memory; resets on restart. record() is try/catch-guarded so it can
- * never break the proxy hot path (same contract as MetricsCollector).
+ * If a `store` is provided, accumulated buckets are persisted across restarts
+ * (debounced atomic write) so the `estimated` quota mode does not reset to 0
+ * after a restart. record() remains try/catch-guarded so it can never break
+ * the proxy hot path (same contract as MetricsCollector).
  */
 export class TokenUsageTracker {
   private byUpstream = new Map<string, { fiveHour: WindowLog; weekly: WindowLog }>();
   private now: () => number;
+  private store?: JsonStateStore;
 
-  constructor(opts: { now?: () => number } = {}) {
+  constructor(opts: { now?: () => number; store?: JsonStateStore } = {}) {
     this.now = opts.now ?? Date.now;
+    this.store = opts.store;
+    if (this.store) {
+      const snap = this.store.load<TokenUsageSnapshot>();
+      if (snap) {
+        try {
+          this.restore(snap);
+          logger.info(`[tokenUsage] restored ${this.byUpstream.size} upstream(s) from persisted state`);
+        } catch (err) {
+          logger.warn('[tokenUsage] restore failed, starting empty:', err);
+          this.byUpstream.clear();
+        }
+      }
+    }
   }
 
   record(upstreamId: string, tokens: number, ts?: number): void {
@@ -39,6 +64,7 @@ export class TokenUsageTracker {
       }
       this.put(entry.fiveHour, t, tokens, TOKEN_FIVEHOUR_BUCKET_MS, FIVEHOUR_WINDOW_MS);
       this.put(entry.weekly, t, tokens, TOKEN_WEEKLY_BUCKET_MS, WEEKLY_WINDOW_MS);
+      this.store?.scheduleSave(this.dump());
     } catch (err) {
       logger.error('[tokenUsage] record failed:', err);
     }
@@ -75,5 +101,47 @@ export class TokenUsageTracker {
       if (bucketTs >= cutoffBucket) sum += tokens;
     }
     return sum;
+  }
+
+  // ── Persistence ──
+
+  /** Serialize all upstream windows to a JSON-friendly snapshot. */
+  dump(): TokenUsageSnapshot {
+    const out: TokenUsageSnapshot = {};
+    for (const [upstreamId, entry] of this.byUpstream) {
+      out[upstreamId] = {
+        fiveHour: this.dumpWindow(entry.fiveHour),
+        weekly: this.dumpWindow(entry.weekly),
+      };
+    }
+    return out;
+  }
+
+  private dumpWindow(log: WindowLog): WindowSnapshot {
+    const o: WindowSnapshot = {};
+    for (const [bucketTs, tokens] of log.buckets) o[String(bucketTs)] = tokens;
+    return o;
+  }
+
+  /** Restore windows from a snapshot. Stale buckets are kept — sumSince()/prune() handle expiry naturally. */
+  restore(snapshot: TokenUsageSnapshot): void {
+    for (const [upstreamId, entry] of Object.entries(snapshot)) {
+      const fiveHour: WindowLog = { buckets: new Map() };
+      const weekly: WindowLog = { buckets: new Map() };
+      this.restoreWindow(fiveHour, entry?.fiveHour);
+      this.restoreWindow(weekly, entry?.weekly);
+      if (fiveHour.buckets.size > 0 || weekly.buckets.size > 0) {
+        this.byUpstream.set(upstreamId, { fiveHour, weekly });
+      }
+    }
+  }
+
+  private restoreWindow(log: WindowLog, raw: WindowSnapshot | undefined): void {
+    if (!raw) return;
+    for (const [k, v] of Object.entries(raw)) {
+      const bucketTs = Number(k);
+      if (!Number.isFinite(bucketTs) || !Number.isFinite(v) || v <= 0) continue;
+      log.buckets.set(bucketTs, v);
+    }
   }
 }
