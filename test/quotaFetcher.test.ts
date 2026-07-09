@@ -208,3 +208,77 @@ test('fetch mode (default) still calls the API — unaffected by estimated work'
   assert.equal(entry.estimated, undefined);   // fetch 模式不带 estimated 标志
   assert.equal(entry.fiveHour!.usedPct, 5);
 });
+
+// ── GLM team-plan fallback: 官方团队套餐没有余量查询接口 ──
+// 接口返回 success=false / "当前用户不存在coding plan"。此时若配了 quotaLimits，
+// 应回退到 estimated 模式（用 TokenUsageTracker 估算），而不是把面板钉死在 error。
+test('GLM fetch: 团队套餐 "不存在coding plan" + quotaLimits → 回退 estimated', async () => {
+  const fakeFetch = (async (url: string) => {
+    if (String(url).includes('bigmodel.cn')) {
+      return new Response(JSON.stringify({ code: 500, success: false, msg: '当前用户不存在coding plan' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('x', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const tracker = new TokenUsageTracker({ now: () => 10_000_000_000 });
+  tracker.record('glm', 16_000_000, 9_990_000_000); // 5h 内 1600万 = 10% of 1.6亿
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 10_000_000_000, tokenUsageTracker: tracker });
+  qf.reload([{
+    upstreamId: 'glm', quotaMode: 'fetch',
+    quotaLimits: { fiveHourTokens: 160_000_000, weeklyTokens: 800_000_000 },
+    credentials: [{ upstreamId: 'glm', credentialId: 'glm-key1', apiKey: 'K', baseURL: 'https://open.bigmodel.cn/api/paas/v4' }],
+  }]);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('glm\0glm-key1')!;
+  assert.equal(entry.status, 'ok', '应回退为 ok 而非 error/not_configured');
+  assert.equal(entry.estimated, true, '回退后必须标记为 estimated');
+  assert.ok(Math.abs(entry.fiveHour!.usedPct - 10) < 0.001, '应使用 TokenUsageTracker 估算的 usedPct');
+});
+
+test('GLM fetch: 团队套餐无 quotaLimits → 保持 not_configured（无法估算）', async () => {
+  const fakeFetch = (async (url: string) => {
+    if (String(url).includes('bigmodel.cn')) {
+      return new Response(JSON.stringify({ success: false, msg: '当前用户不存在coding plan' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('x', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1, tokenUsageTracker: new TokenUsageTracker() });
+  qf.reload([{ upstreamId: 'glm', quotaMode: 'fetch', credentials: [{ upstreamId: 'glm', credentialId: 'k1', apiKey: 'K', baseURL: 'https://open.bigmodel.cn/api/paas/v4' }] }]);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('glm\0k1')!;
+  assert.equal(entry.status, 'not_configured');
+  assert.equal(entry.estimated, undefined);
+});
+
+test('GLM fetch: 其它 success=false 错误不触发回退（仍为 error）', async () => {
+  const fakeFetch = (async (url: string) => {
+    if (String(url).includes('bigmodel.cn')) {
+      return new Response(JSON.stringify({ success: false, msg: '内部错误' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('x', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1, tokenUsageTracker: new TokenUsageTracker() });
+  qf.reload([{ upstreamId: 'glm', quotaMode: 'fetch', quotaLimits: { fiveHourTokens: 160_000_000 }, credentials: [{ upstreamId: 'glm', credentialId: 'k1', apiKey: 'K', baseURL: 'https://open.bigmodel.cn/api/paas/v4' }] }]);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('glm\0k1')!;
+  assert.equal(entry.status, 'error', '非"不存在coding plan"错误不应回退');
+  assert.equal(entry.estimated, undefined);
+});
+
+test('MiniMax fetch: error 不受 GLM 回退逻辑影响', async () => {
+  const fakeFetch = (async (url: string) => {
+    if (String(url).includes('minimaxi.com')) {
+      return new Response(JSON.stringify({ base_resp: { status_code: 1001, status_msg: '不存在coding plan' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('x', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1, tokenUsageTracker: new TokenUsageTracker() });
+  qf.reload([{ upstreamId: 'minimax', quotaMode: 'fetch', quotaLimits: { fiveHourTokens: 160_000_000 }, credentials: [{ upstreamId: 'minimax', credentialId: 'mm1', apiKey: 'K', baseURL: 'https://api.minimaxi.com/v1' }] }]);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('minimax\0mm1')!;
+  assert.equal(entry.status, 'error', 'MiniMax 错误不应触发 GLM 专属回退');
+});

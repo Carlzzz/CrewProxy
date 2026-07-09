@@ -105,6 +105,14 @@ function glmQuotaBase(baseURL: string): string {
   return baseURL.toLowerCase().includes('bigmodel.cn') ? 'https://open.bigmodel.cn' : 'https://api.z.ai';
 }
 
+/** True if at least one quota limit is configured — i.e. estimated mode can
+ *  produce a meaningful usedPct. Without limits, falling back to estimated
+ *  would yield an empty (tier-less) snapshot, so we stay not_configured. */
+function hasQuotaLimits(limits?: { fiveHourTokens?: number; weeklyTokens?: number }): boolean {
+  return typeof limits?.fiveHourTokens === 'number' && limits.fiveHourTokens > 0
+    || typeof limits?.weeklyTokens === 'number' && limits.weeklyTokens > 0;
+}
+
 async function queryGlm(ref: QuotaCredentialRef, fetchImpl: typeof fetch): Promise<CredentialQuota> {
   const url = `${glmQuotaBase(ref.baseURL)}/api/monitor/usage/quota/limit`;
   const resp = await fetchImpl(url, {
@@ -115,7 +123,18 @@ async function queryGlm(ref: QuotaCredentialRef, fetchImpl: typeof fetch): Promi
   if (resp.status === 401 || resp.status === 403) return { status: 'expired', queriedAt: Date.now() };
   if (!resp.ok) { logger.verbose(`[quota] GLM non-2xx ${resp.status} for ${ref.upstreamId}`); return { status: 'error', error: `GLM HTTP ${resp.status}`, queriedAt: Date.now() }; }
   const body: any = await resp.json();
-  if (body?.success === false) return { status: 'error', error: `GLM: ${body.msg ?? 'unknown'}`, queriedAt: Date.now() };
+  if (body?.success === false) {
+    const msg = String(body?.msg ?? '');
+    // Team-plan (团队套餐) accounts have no official coding-plan quota query
+    // interface — the endpoint replies success=false with "当前用户不存在
+    // coding plan". Signal not_configured so refreshOnce can fall back to
+    // estimated mode (computed from TokenUsageTracker + quotaLimits) instead
+    // of surfacing a permanent error on the dashboard.
+    if (/coding plan|不存在/i.test(msg)) {
+      return { status: 'not_configured', error: msg, queriedAt: Date.now() };
+    }
+    return { status: 'error', error: `GLM: ${msg || 'unknown'}`, queriedAt: Date.now() };
+  }
   const tiers = parseGlmTiers(body?.data);
   return { ...tiers, status: 'ok', queriedAt: Date.now() };
 }
@@ -186,7 +205,14 @@ export class QuotaFetcher {
         const provider = detectQuotaProvider(ref.baseURL);
         if (!provider) { this.snapshot.set(key, { status: 'not_configured', queriedAt: this.now() }); return; }
         try {
-          const result = provider === 'glm' ? await queryGlm(ref, this.fetchImpl) : await queryMinimax(ref, this.fetchImpl);
+          let result = provider === 'glm' ? await queryGlm(ref, this.fetchImpl) : await queryMinimax(ref, this.fetchImpl);
+          // GLM team-plan accounts expose no official quota query interface
+          // (queryGlm returns not_configured with "当前用户不存在coding plan").
+          // Fall back to estimated mode from TokenUsageTracker + quotaLimits so
+          // the dashboard and proactive cooldown still have usable numbers.
+          if (provider === 'glm' && result.status === 'not_configured' && hasQuotaLimits(u.quotaLimits)) {
+            result = this.buildEstimatedQuota(u);
+          }
           if (result.status === 'error') {
             const prior = this.snapshot.get(key);
             if (prior) {
