@@ -31,10 +31,14 @@ export function validateResolvedProxyConfig(config: ProxyConfig): ValidationResu
       errors.push({ path: base, message: 'upstreamId 只能含字母、数字、下划线或短横线' });
     }
     upstreamIds.add(id);
-    errors.push(...validateUpstream(base, u));
+    const ur = validateUpstream(base, u);
+    errors.push(...ur.errors);
+    warnings.push(...ur.warnings);
   }
   if (config.defaultUpstream) {
-    errors.push(...validateUpstream('defaultUpstream', config.defaultUpstream));
+    const dr = validateUpstream('defaultUpstream', config.defaultUpstream);
+    errors.push(...dr.errors);
+    warnings.push(...dr.warnings);
   }
 
   const routes = config.modelRoutes ?? {};
@@ -55,13 +59,18 @@ export function validateResolvedProxyConfig(config: ProxyConfig): ValidationResu
   return { ok: errors.length === 0, errors, warnings };
 }
 
-function validateUpstream(base: string, u: UpstreamConfig): ValidationIssue[] {
+function validateUpstream(base: string, u: UpstreamConfig): { errors: ValidationIssue[]; warnings: ValidationIssue[] } {
   const errs: ValidationIssue[] = [];
+  const warns: ValidationIssue[] = [];
   if (!isUrl(u.baseURL)) errs.push({ path: `${base}.baseURL`, message: 'baseURL 必须是合法 http(s) URL' });
   if (!u.apiKey) errs.push({ path: `${base}.apiKey`, message: 'apiKey 必填' });
   if (!u.model) errs.push({ path: `${base}.model`, message: 'model 必填' });
+  // provider is free-form in the proxy (only affects request transformation;
+  // unknown providers are served via the generic Chat Completions path), so an
+  // unrecognized value is a warning, not a hard error. This keeps real configs
+  // that use provider values like "gpt" validatable.
   if (u.provider !== undefined && u.provider !== '' && !ALLOWED_PROVIDERS.has(u.provider)) {
-    errs.push({ path: `${base}.provider`, message: `provider 不在允许列表内：${u.provider}` });
+    warns.push({ path: `${base}.provider`, message: `provider "${u.provider}" 不在已知列表中，将按通用 Chat Completions 模式处理` });
   }
   if (u.codePlanCredentials) {
     const seen = new Set<string>();
@@ -82,7 +91,7 @@ function validateUpstream(base: string, u: UpstreamConfig): ValidationIssue[] {
       errs.push({ path: `${base}.quotaLimits.weeklyTokens`, message: 'weeklyTokens 必须为正整数' });
     }
   }
-  return errs;
+  return { errors: errs, warnings: warns };
 }
 
 export function validateProxyConfigDraft(draft: unknown): ValidationResult {

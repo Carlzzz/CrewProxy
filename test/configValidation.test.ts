@@ -75,11 +75,12 @@ test('rejects empty upstreamsById', () => {
   assert.equal(r.ok, false);
 });
 
-test('rejects unknown provider', () => {
-  const cfg = { upstreamsById: { glm: baseUpstream({ provider: 'unknown-provider' }) } } as ProxyConfig;
+test('unknown provider is a warning, not an error (proxy is free-form)', () => {
+  const cfg = { upstreamsById: { gpt: baseUpstream({ provider: 'gpt' }) } } as ProxyConfig;
   const r = validateResolvedProxyConfig(cfg);
-  assert.equal(r.ok, false);
-  assert.ok(r.errors.some(e => e.path === 'upstreamsById.glm.provider'));
+  assert.equal(r.ok, true);
+  assert.ok(r.warnings.some(w => w.path === 'upstreamsById.gpt.provider'));
+  assert.equal(r.errors.length, 0);
 });
 
 test('accepts zai and ali providers', () => {
