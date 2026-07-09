@@ -146,12 +146,14 @@ export class QuotaFetcher {
   private fetchImpl: typeof fetch;
   private now: () => number;
   private tokenUsageTracker?: TokenUsageTracker;
+  private onRefresh?: (snapshot: Map<string, CredentialQuota>) => void;
 
-  constructor(opts: { fetchImpl?: typeof fetch; intervalMs?: number; now?: () => number; tokenUsageTracker?: TokenUsageTracker } = {}) {
+  constructor(opts: { fetchImpl?: typeof fetch; intervalMs?: number; now?: () => number; tokenUsageTracker?: TokenUsageTracker; onRefresh?: (snapshot: Map<string, CredentialQuota>) => void } = {}) {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.intervalMs = opts.intervalMs ?? DEFAULT_INTERVAL_MS;
     this.now = opts.now ?? Date.now;
     this.tokenUsageTracker = opts.tokenUsageTracker;
+    this.onRefresh = opts.onRefresh;
   }
 
   reload(upstreams: QuotaUpstreamRef[]): void {
@@ -205,6 +207,10 @@ export class QuotaFetcher {
         }
       }));
     }));
+    // Notify the credential pool so proactive quota data can steer traffic
+    // (mark/clear cooldowns) — this is what connects "dashboard says exhausted"
+    // to "selection actually skips the key".
+    this.onRefresh?.(this.getSnapshot());
   }
 
   private buildEstimatedQuota(u: QuotaUpstreamRef): CredentialQuota {

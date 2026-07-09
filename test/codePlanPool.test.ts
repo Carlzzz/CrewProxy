@@ -4,6 +4,7 @@ import path from 'path';
 import os from 'os';
 import { CodePlanPoolManager } from '../src/codePlanPool';
 import type { ProxyConfig } from '../src/config';
+import type { CredentialQuota } from '../src/quotaFetcher';
 import { JsonStateStore } from '../src/stateStore';
 
 function configWithPool(): ProxyConfig {
@@ -98,4 +99,100 @@ test('store-backed pool restores cooldowns across instances', () => {
   const k1 = b.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!;
   assert.equal(k1.inCooldown, true);
   assert.equal(k1.cooldownReason, 'quota');
+});
+
+// ── Selection (pickOrFallback) ──
+
+test('no-session selection round-robins across keys when in-flight is tied', () => {
+  // Regression: previously the lowest-in-flight pick used strict `<` with the
+  // first available index as initial min, so when every key read in-flight=0
+  // (the common case — in-flight is released at header time), the SAME first
+  // credential was selected every time. Round-robin must now spread the load.
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool()); // glm-key1, glm-key2
+  const seen = new Set<string>();
+  for (let i = 0; i < 4; i++) {
+    const r = pool.pickOrFallback('glm')!;
+    assert.ok(r.credentialId);
+    seen.add(r.credentialId);
+    pool.decInFlight('glm', r.credentialId); // release immediately → next pick sees 0 again
+  }
+  assert.ok(seen.has('glm-key1'), 'expected glm-key1 to be picked at least once');
+  assert.ok(seen.has('glm-key2'), 'expected glm-key2 to be picked at least once');
+});
+
+function quotaSnap(entries: Array<[string, number]>): Map<string, CredentialQuota> {
+  const m = new Map<string, CredentialQuota>();
+  for (const [id, usedPct] of entries) {
+    m.set(`glm\0${id}`, {
+      status: 'ok',
+      fiveHour: { usedPct, resetsAt: null },
+      queriedAt: Date.now(),
+    });
+  }
+  return m;
+}
+
+test('applyQuotaSnapshot steers traffic away from an exhausted credential', () => {
+  // Regression: the dashboard showed minimax-key1 at 100% but traffic kept
+  // hitting it, because quota data never reached selection. Now a fresh quota
+  // snapshot at 100% proactively cools the credential down.
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  pool.applyQuotaSnapshot(quotaSnap([['glm-key1', 100], ['glm-key2', 40]]));
+
+  const k1 = pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!;
+  assert.equal(k1.inCooldown, true);
+  assert.equal(k1.cooldownReason, 'quota');
+
+  for (let i = 0; i < 5; i++) {
+    const r = pool.pickOrFallback('glm')!;
+    assert.equal(r.credentialId, 'glm-key2', 'exhausted key must never be picked while healthy alternatives exist');
+    pool.decInFlight('glm', r.credentialId);
+  }
+});
+
+test('applyQuotaSnapshot clears stale quota cooldown once quota recovers', () => {
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  // Exhaust key1, then a later snapshot reports it recovered.
+  pool.applyQuotaSnapshot(quotaSnap([['glm-key1', 100], ['glm-key2', 40]]));
+  assert.equal(pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, true);
+  pool.applyQuotaSnapshot(quotaSnap([['glm-key1', 30], ['glm-key2', 20]]));
+  assert.equal(pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, false);
+});
+
+test('quota snapshot with resetsAt sets cooldown until the reset time', () => {
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  const resetsAt = new Date(Date.now() + 2 * 3_600_000).toISOString(); // +2h
+  const m = new Map<string, CredentialQuota>([
+    ['glm\0glm-key1', { status: 'ok', fiveHour: { usedPct: 100, resetsAt }, queriedAt: Date.now() }],
+  ]);
+  pool.applyQuotaSnapshot(m);
+  const k1 = pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!;
+  assert.equal(k1.inCooldown, true);
+  // Cooldown should be roughly 2h out (within a generous tolerance), not the 30min default.
+  assert.ok(k1.cooldownUntil && k1.cooldownUntil > Date.now() + 60 * 60_000, 'cooldown must respect resetsAt');
+});
+
+test('quota snapshot does not act on stale/error quota data', () => {
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  const m = new Map<string, CredentialQuota>([
+    ['glm\0glm-key1', { status: 'error', error: 'boom', queriedAt: Date.now() }],
+  ]);
+  pool.applyQuotaSnapshot(m);
+  assert.equal(pool.getPoolStatus('glm').find(c => c.credentialId === 'glm-key1')!.inCooldown, false);
+});
+
+test('all credentials quota-exhausted falls back to serving (safety valve)', () => {
+  // If proactive quota data says everything is dead, we must NOT take the whole
+  // pool down — better to serve the least-bad key than hard-fail. This guards
+  // against stale / over-estimated quota snapshots causing an outage.
+  const pool = new CodePlanPoolManager();
+  pool.reconcileFromConfig(configWithPool());
+  pool.applyQuotaSnapshot(quotaSnap([['glm-key1', 100], ['glm-key2', 100]]));
+  const r = pool.pickOrFallback('glm');
+  assert.ok(r.credentialId, 'must still return a credential when all keys look exhausted');
 });

@@ -18,6 +18,13 @@ const QUOTA_KEYWORDS = [
   'monthly', 'daily limit',
   'insufficient quota', 'quota_exceeded',
   '用量', 'plan limit', 'subscription',
+  // GLM (Zhipu) balance / resource-pack exhaustion — returned as a 429 whose
+  // JSON `type` is "rate_limit_error", but the message is account-billing, not
+  // QPS. Without these, the `rate_limit_error` substring would misclassify it
+  // as a transient burst and only give a 30s cooldown, causing the key to be
+  // retried (and re-rejected) every 30s forever.
+  '余额不足', '资源包', '请充值', '余额',
+  'insufficient balance', 'no enough balance',
 ];
 
 const RATE_LIMIT_KEYWORDS = [
@@ -32,13 +39,16 @@ export function classify429(status: number, bodyText: string): QuotaClass {
   if (status !== 429) return 'unknown';
   const lower = bodyText.toLowerCase();
 
-  // Rate-limit keywords take precedence — phrases like "rate limit exceeded"
-  // contain "limit" but are clearly rate-limit, not quota.
-  for (const kw of RATE_LIMIT_KEYWORDS) {
-    if (lower.includes(kw.toLowerCase())) return 'rate_limit';
-  }
+  // QUOTA is checked first: providers like GLM emit a 429 whose JSON `type`
+  // is "rate_limit_error" even for account-balance exhaustion, so the
+  // `rate_limit` substring would otherwise mask a genuine quota/balance
+  // outage. QUOTA_KEYWORDS are specific enough (余额/配额/quota/subscription…)
+  // that a pure QPS rate-limit message won't contain them.
   for (const kw of QUOTA_KEYWORDS) {
     if (lower.includes(kw.toLowerCase())) return 'quota';
+  }
+  for (const kw of RATE_LIMIT_KEYWORDS) {
+    if (lower.includes(kw.toLowerCase())) return 'rate_limit';
   }
   return 'unknown';
 }

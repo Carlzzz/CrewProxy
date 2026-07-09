@@ -20,7 +20,7 @@
       "provider": "glm",
       "codePlanCredentials": [
         { "id": "glm-key1", "apiKey": "80af09342418496ba392473ad8804cba.LFQMegoXucyKML37", "weight": 1, "enabled": true },
-        { "id": "glm-key2", "apiKey": "40347a66080e418280f1d436a7925631.s6wIJNHi1S69V2TO", "weight": 1, "enabled": true }
+        { "id": "glm-key2", "apiKey": "74742dd73ee5475c8ab8360df68070bf.bPptwDQG7okvSyLD", "weight": 1, "enabled": true }
       ],
       "quotaMode": "estimated",
       "quotaLimits": { "fiveHourTokens": 160000000, "weeklyTokens": 800000000 }

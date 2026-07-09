@@ -1,5 +1,6 @@
 import type { ProxyConfig, CodePlanCredential } from './config';
 import type { JsonStateStore } from './stateStore';
+import type { CredentialQuota } from './quotaFetcher';
 import { logger } from './logger';
 
 export interface CodePlanPickResult {
@@ -20,6 +21,11 @@ export interface CredentialHeatmap {
 
 export const CODE_PLAN_COOLDOWN_MS = 30 * 60 * 1000;
 export const CODE_PLAN_SHORT_COOLDOWN_MS = 30_000; // 30 s for rate-limit burst
+/** Cap on a proactive (quota-derived) cooldown so a corrupt resetsAt can never
+ *  pin a credential out of rotation for an unbounded time. */
+const QUOTA_COOLDOWN_CAP_MS = 6 * 60 * 60 * 1000; // 6 h
+/** A credential is treated as quota-exhausted at/above this usedPct. */
+const DEFAULT_QUOTA_EXHAUSTION_PCT = 100;
 
 export type CooldownReason = 'quota' | 'rate_limit' | 'network';
 
@@ -94,12 +100,20 @@ export class CodePlanPoolManager {
         availableIndices.push(i);
       }
     }
-    if (availableIndices.length === 0) {
-      return { credentialId: null, apiKey: '', upstreamKey };
-    }
 
     let selectedIdx: number;
-    if (sessionId) {
+    if (availableIndices.length === 0) {
+      // Safety valve: if EVERY credential is blocked only by proactive
+      // (quota-derived) cooldowns, the quota data is either stale or the whole
+      // plan is genuinely drained. Either way, hard-failing the pool is worse
+      // than trying the least-loaded key — serve anyway and let the next 429
+      // re-cool a specific key if the data was right.
+      if (this.allBlockedByQuotaOnly(upstreamKey, credentials)) {
+        selectedIdx = this.pickLowestInFlight(upstreamKey, credentials, credentials.map((_, i) => i));
+      } else {
+        return { credentialId: null, apiKey: '', upstreamKey };
+      }
+    } else if (sessionId) {
       // Hash to slot on the FULL list, then probe for first available
       const startSlot = this.sessionIdToCodePlanSlot(sessionId, credentials.length);
       let found = -1;
@@ -113,18 +127,11 @@ export class CodePlanPoolManager {
       // Should always find one since availableIndices.length > 0
       selectedIdx = found >= 0 ? found : availableIndices[0];
     } else {
-      // **Fix #3: pick the available credential with the LOWEST in-flight count**
-      let minIdx = availableIndices[0];
-      let minVal = this.inFlight.get(this.inFlightKey(upstreamKey, credentials[minIdx].id)) ?? 0;
-      for (let i = 1; i < availableIndices.length; i++) {
-        const idx = availableIndices[i];
-        const v = this.inFlight.get(this.inFlightKey(upstreamKey, credentials[idx].id)) ?? 0;
-        if (v < minVal) {
-          minVal = v;
-          minIdx = idx;
-        }
-      }
-      selectedIdx = minIdx;
+      // Pick the available credential with the LOWEST in-flight count; break
+      // ties by round-robin so that when in-flight is uniformly 0 (the common
+      // case — in-flight is released at header time) traffic spreads across
+      // healthy keys instead of always landing on the first one.
+      selectedIdx = this.pickLowestInFlight(upstreamKey, credentials, availableIndices);
     }
 
     const selected = credentials[selectedIdx];
@@ -162,6 +169,67 @@ export class CodePlanPoolManager {
     this.store?.scheduleSave(this.dumpCooldowns());
   }
 
+  /**
+   * Consume a fresh quota snapshot (keyed `${upstreamKey}\0${credentialId}`,
+   * the same format QuotaFetcher produces) and proactively steer traffic:
+   *  - A credential whose fresh quota shows usedPct ≥ exhaustionPct is cooled
+   *    down with reason 'quota', until the soonest tier reset (capped) or a
+   *    default 30 min that gets refreshed on each poll.
+   *  - A credential the snapshot reports as recovered (usedPct < threshold)
+   *    has any stale proactive 'quota' cooldown cleared. Reactive cooldowns
+   *    (rate_limit / network / real-429 quota) are left untouched.
+   *
+   * This is the missing link that previously let an exhausted key keep
+   * receiving traffic: the quota data existed but never reached selection.
+   */
+  applyQuotaSnapshot(snapshot: Map<string, CredentialQuota>, exhaustionPct: number = DEFAULT_QUOTA_EXHAUSTION_PCT): void {
+    const now = Date.now();
+    let mutated = false;
+    for (const [key, q] of snapshot) {
+      const sep = key.indexOf('\0');
+      if (sep < 0) continue;
+      const upstreamKey = key.slice(0, sep);
+      const credentialId = key.slice(sep + 1);
+
+      // Only steer on fresh, successful quota reads — never on stale errors.
+      if (q.status !== 'ok') continue;
+      const tiers = [q.fiveHour, q.weekly].filter((t): t is NonNullable<typeof t> => !!t);
+      if (tiers.length === 0) continue;
+
+      const worst = Math.max(...tiers.map(t => t.usedPct));
+      const ck = this.cooldownKey(upstreamKey, credentialId);
+
+      if (worst >= exhaustionPct) {
+        const resets = tiers
+          .filter(t => t.usedPct >= exhaustionPct)
+          .map(t => Date.parse(t.resetsAt ?? ''))
+          .filter(n => Number.isFinite(n) && n > now)
+          .sort((a, b) => a - b);
+        const cooldownMs = resets.length > 0
+          ? Math.min(resets[0] - now, QUOTA_COOLDOWN_CAP_MS)
+          : CODE_PLAN_COOLDOWN_MS;
+        // Avoid redundant writes when an equivalent cooldown is already in place.
+        const existing = this.cooldowns.get(ck);
+        const existingReason = this.cooldownReasons.get(ck);
+        if (existingReason !== 'quota' || existing === undefined || Math.abs(existing - (now + cooldownMs)) > 60_000) {
+          this.cooldowns.set(ck, now + cooldownMs);
+          this.cooldownReasons.set(ck, 'quota');
+          logger.verbose(`[codePlan] proactive quota cooldown for ${upstreamKey}/${credentialId}: ${Math.round(cooldownMs / 1000)}s (worst=${worst.toFixed(1)}%)`);
+          mutated = true;
+        }
+      } else {
+        // Fresh quota says healthy — clear a stale proactive quota cooldown.
+        // (Reactive cooldowns from real 429s keep their own reason and survive.)
+        if (this.cooldownReasons.get(ck) === 'quota') {
+          this.cooldowns.delete(ck);
+          this.cooldownReasons.delete(ck);
+          mutated = true;
+        }
+      }
+    }
+    if (mutated) this.store?.scheduleSave(this.dumpCooldowns());
+  }
+
   // ── private helpers ──
 
   private isInCooldown(upstreamKey: string, credentialId: string): boolean {
@@ -171,6 +239,37 @@ export class CodePlanPoolManager {
     if (Date.now() > expiry) {
       this.cooldowns.delete(key);
       return false;
+    }
+    return true;
+  }
+
+  /** Pick the credential with the lowest in-flight count among `indices`,
+   *  breaking ties via the round-robin counter so a uniform 0 doesn't collapse
+   *  to "always the first key". Returns the chosen array index. */
+  private pickLowestInFlight(upstreamKey: string, credentials: CodePlanCredential[], indices: number[]): number {
+    let minVal = Infinity;
+    for (const idx of indices) {
+      const v = this.inFlight.get(this.inFlightKey(upstreamKey, credentials[idx].id)) ?? 0;
+      if (v < minVal) minVal = v;
+    }
+    const ties = indices.filter(idx =>
+      (this.inFlight.get(this.inFlightKey(upstreamKey, credentials[idx].id)) ?? 0) === minVal
+    );
+    const rr = this.roundRobin.get(upstreamKey) ?? 0;
+    const chosen = ties[rr % Math.max(ties.length, 1)];
+    this.roundRobin.set(upstreamKey, (rr + 1) % Math.max(ties.length, 1));
+    return chosen;
+  }
+
+  /** True when every credential in the pool is currently cooled down AND every
+   *  cooldown is proactive (quota-derived). Used by the safety valve. */
+  private allBlockedByQuotaOnly(upstreamKey: string, credentials: CodePlanCredential[]): boolean {
+    if (credentials.length === 0) return false;
+    for (const c of credentials) {
+      const ck = this.cooldownKey(upstreamKey, c.id);
+      const expiry = this.cooldowns.get(ck);
+      if (expiry === undefined || Date.now() > expiry) return false; // not blocked
+      if (this.cooldownReasons.get(ck) !== 'quota') return false; // blocked by something real
     }
     return true;
   }

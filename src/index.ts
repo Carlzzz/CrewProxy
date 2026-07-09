@@ -61,7 +61,14 @@ function buildQuotaUpstreams(cfg: ProxyConfig): QuotaUpstreamRef[] {
   return out;
 }
 
-const quotaFetcher = new QuotaFetcher({ tokenUsageTracker: tokenUsage });
+const quotaFetcher = new QuotaFetcher({
+  tokenUsageTracker: tokenUsage,
+  // Feed every fresh quota snapshot into the pool so an exhausted credential
+  // is proactively cooled down (and recovered ones released) without waiting
+  // for a reactive 429. This closes the gap where the dashboard showed a key
+  // at 100% but traffic kept hitting it.
+  onRefresh: (snap) => codePlanPool.applyQuotaSnapshot(snap),
+});
 quotaFetcher.reload(buildQuotaUpstreams(currentConfig));
 quotaFetcher.start();
 ctx.quotaFetcher = quotaFetcher;
