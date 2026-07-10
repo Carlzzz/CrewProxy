@@ -28,5 +28,7 @@ export declare function formatFetchError(err: any): UpstreamErrorInfo;
  *  key: for overload every key sees the same condition, and for gateway errors
  *  freezing the pool extends a sub-second blip into a 30s outage. */
 export declare function isTransientServerError(status: number, errText: string): boolean;
+/** Parse an HTTP Retry-After header (delta-seconds or HTTP-date) → ms. */
+export declare function parseRetryAfterMs(val: string | null): number | null;
 export declare function createProxyServer(ctx: ProxyRuntimeContext): http.Server;
 export {};

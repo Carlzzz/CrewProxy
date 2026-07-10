@@ -11,6 +11,22 @@ import { CodePlanPoolManager } from '../src/codePlanPool';
 // metricsEndpoint.test.ts). auth failure would short-circuit before upstream.
 process.env.WOICLAW_AUTH_BYPASS = '1';
 
+// Production backoff is ~60s (aggressive). Shrink it via env so these tests
+// run in milliseconds instead of minutes. Restores prior values on completion.
+const BACKOFF_ENV = ['WOICLAW_TRANSIENT_MAX_RETRIES', 'WOICLAW_TRANSIENT_BASE_MS', 'WOICLAW_TRANSIENT_CAP_MS'] as const;
+function withFastBackoff<T>(fn: () => Promise<T>): Promise<T> {
+  const saved = BACKOFF_ENV.map((k) => [k, process.env[k]] as const);
+  process.env.WOICLAW_TRANSIENT_MAX_RETRIES = '3';
+  process.env.WOICLAW_TRANSIENT_BASE_MS = '5';
+  process.env.WOICLAW_TRANSIENT_CAP_MS = '10';
+  return fn().finally(() => {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  });
+}
+
 function post(port: number, path: string, headers: Record<string, string>, body: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const req = http.request(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers }, (res) => {
@@ -24,137 +40,17 @@ function post(port: number, path: string, headers: Record<string, string>, body:
   });
 }
 
-// End-to-end test of the overload backoff path: GLM returns 529 (code 1305
-// "该模型当前访问量过大") a few times then recovers. The proxy must retry
-// internally on the SAME credential and return 200 to the client, and must NOT
-// cool down the key (so the next request isn't frozen for 30s).
-test('529 overload: proxy retries internally → 200 to client, pool not frozen', async () => {
-  let upstreamCalls = 0;
-  const mockUpstream = http.createServer((req, res) => {
-    let b = '';
-    req.on('data', (c) => { b += c; });
-    req.on('end', () => {
-      upstreamCalls += 1;
-      if (upstreamCalls <= 3) {
-        res.writeHead(529, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          type: 'error',
-          error: { type: 'overloaded_error', code: '1305', message: '[1305][该模型当前访问量过大]' },
-        }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          id: 'msg_test', type: 'message', role: 'assistant', model: 'glm-5.2',
-          content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn',
-          usage: { input_tokens: 5, output_tokens: 2 },
-        }));
-      }
-    });
-  });
-  await new Promise<void>((r) => mockUpstream.listen(0, '127.0.0.1', r));
-  const mockPort = (mockUpstream.address() as any).port;
-
-  const glmUpstream: any = {
-    baseURL: `http://127.0.0.1:${mockPort}`, apiKey: '', model: 'glm-5.2', provider: 'glm',
-    codePlanCredentials: [{ id: 'glm-key1', apiKey: 'k1', weight: 1, enabled: true }],
-  };
-  const ctx: ProxyRuntimeContext = {
-    upstreamsByIdMap: new Map([['glm', glmUpstream]]),
-    defaultUpstream: undefined,
-    modelRoutesMap: new Map([['glm-5.2', { upstream: 'glm' }]]),
-    codePlanPool: new CodePlanPoolManager(),
-    metrics: new MetricsCollector(() => 10_000_000),
-    quotaFetcher: new QuotaFetcher({ now: () => 1 }),
-  } as any;
-  ctx.codePlanPool!.reconcileFromConfig({ upstreamsById: { glm: glmUpstream } } as any);
-
-  const server = createProxyServer(ctx);
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  const port = (server.address() as any).port;
-
-  try {
-    const body = JSON.stringify({ model: 'glm-5.2', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
-    const r1 = await post(port, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, body);
-    // Client must see 200 even though upstream returned 529 three times.
-    assert.equal(r1.status, 200);
-    assert.ok(upstreamCalls >= 4, `expected >=4 upstream calls after internal retry, got ${upstreamCalls}`);
-
-    // Pool must NOT be cooled down: a second request immediately succeeds.
-    // (If the 529 had cooled the key for 30s, this would surface 529 instantly.)
-    const before = upstreamCalls;
-    const r2 = await post(port, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, body);
-    assert.equal(r2.status, 200);
-    assert.ok(upstreamCalls > before, 'second request should hit upstream, proving pool was not frozen');
-  } finally {
-    server.close();
-    mockUpstream.close();
-  }
+const OK_BODY = JSON.stringify({
+  id: 'msg_t', type: 'message', role: 'assistant', model: 'glm-5.2',
+  content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn',
+  usage: { input_tokens: 5, output_tokens: 2 },
 });
+const REQ_BODY = JSON.stringify({ model: 'glm-5.2', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
 
-// Negative case: if overload persists through all backoffs, the proxy surfaces
-// the 529 to the client but still does NOT cool down the key.
-test('529 overload persists: surfaces 529, pool still not frozen', async () => {
-  let upstreamCalls = 0;
-  const mockUpstream = http.createServer((req, res) => {
-    let b = '';
-    req.on('data', (c) => { b += c; });
-    req.on('end', () => {
-      upstreamCalls += 1;
-      res.writeHead(529, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', code: '1305', message: 'busy' } }));
-    });
-  });
-  await new Promise<void>((r) => mockUpstream.listen(0, '127.0.0.1', r));
-  const mockPort = (mockUpstream.address() as any).port;
-
-  const glmUpstream: any = {
-    baseURL: `http://127.0.0.1:${mockPort}`, apiKey: '', model: 'glm-5.2', provider: 'glm',
-    codePlanCredentials: [{ id: 'glm-key1', apiKey: 'k1', weight: 1, enabled: true }],
-  };
-  const ctx: ProxyRuntimeContext = {
-    upstreamsByIdMap: new Map([['glm', glmUpstream]]),
-    defaultUpstream: undefined,
-    modelRoutesMap: new Map([['glm-5.2', { upstream: 'glm' }]]),
-    codePlanPool: new CodePlanPoolManager(),
-    metrics: new MetricsCollector(() => 10_000_000),
-    quotaFetcher: new QuotaFetcher({ now: () => 1 }),
-  } as any;
-  ctx.codePlanPool!.reconcileFromConfig({ upstreamsById: { glm: glmUpstream } } as any);
-
-  const server = createProxyServer(ctx);
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  const port = (server.address() as any).port;
-
-  try {
-    const body = JSON.stringify({ model: 'glm-5.2', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
-    const r1 = await post(port, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, body);
-    // Persisted overload is surfaced (529, not a misleading 502).
-    assert.equal(r1.status, 529);
-    // Backoff made several attempts beyond the first.
-    assert.ok(upstreamCalls > 1, `expected retries, got ${upstreamCalls}`);
-  } finally {
-    server.close();
-    mockUpstream.close();
-  }
-});
-
-// 502 gateway error is also transient: backoff-retry on a SINGLE-KEY provider
-// (no codePlanCredentials) proves non-pool providers get the retry too.
-async function startSingleKeyMock(handler: (req: http.IncomingMessage, res: http.ServerResponse, call: number) => void) {
-  let calls = 0;
-  const mockUpstream = http.createServer((req, res) => {
-    let b = '';
-    req.on('data', (c) => { b += c; });
-    req.on('end', () => { calls += 1; handler(req, res, calls); });
-  });
-  await new Promise<void>((r) => mockUpstream.listen(0, '127.0.0.1', r));
-  return { mockUpstream, port: (mockUpstream.address() as any).port, getCalls: () => calls };
-}
-
-function ctxFor(port: number): ProxyRuntimeContext {
+function buildCtx(port: number, withPool: boolean): ProxyRuntimeContext {
   const up: any = {
-    baseURL: `http://127.0.0.1:${port}`, apiKey: 'k1', model: 'glm-5.2', provider: 'glm',
-    // NOTE: no codePlanCredentials → hasCodePlan=false (single-key provider path)
+    baseURL: `http://127.0.0.1:${port}`, apiKey: withPool ? '' : 'k1', model: 'glm-5.2', provider: 'glm',
+    ...(withPool ? { codePlanCredentials: [{ id: 'glm-key1', apiKey: 'k1', weight: 1, enabled: true }] } : {}),
   };
   const ctx: ProxyRuntimeContext = {
     upstreamsByIdMap: new Map([['glm', up]]),
@@ -164,60 +60,148 @@ function ctxFor(port: number): ProxyRuntimeContext {
     metrics: new MetricsCollector(() => 10_000_000),
     quotaFetcher: new QuotaFetcher({ now: () => 1 }),
   } as any;
+  ctx.codePlanPool!.reconcileFromConfig({ upstreamsById: { glm: up } } as any);
   return ctx;
 }
 
-const OK_BODY = JSON.stringify({
-  id: 'msg_t', type: 'message', role: 'assistant', model: 'glm-5.2',
-  content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn',
-  usage: { input_tokens: 5, output_tokens: 2 },
-});
-const REQ_BODY = JSON.stringify({ model: 'glm-5.2', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
+async function startMock(handler: (res: http.ServerResponse, call: number) => void) {
+  let calls = 0;
+  const mockUpstream = http.createServer((req, res) => {
+    let b = '';
+    req.on('data', (c) => { b += c; });
+    req.on('end', () => { calls += 1; handler(res, calls); });
+  });
+  await new Promise<void>((r) => mockUpstream.listen(0, '127.0.0.1', r));
+  return { mockUpstream, port: (mockUpstream.address() as any).port, getCalls: () => calls };
+}
 
+async function withProxy<T>(port: number, withPool: boolean, fn: (proxyPort: number) => Promise<T>): Promise<T> {
+  const ctx = buildCtx(port, withPool);
+  const server = createProxyServer(ctx);
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  const proxyPort = (server.address() as any).port;
+  try {
+    return await fn(proxyPort);
+  } finally {
+    server.close();
+  }
+}
+
+// ── Pool provider (GLM/minimax-style): 529 three times then recovers ──
+test('529 overload: proxy retries internally → 200, pool not frozen', async () => {
+  await withFastBackoff(async () => {
+    const mock = await startMock((res, call) => {
+      if (call <= 3) {
+        res.writeHead(529, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', code: '1305', message: '[1305][该模型当前访问量过大]' } }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(OK_BODY);
+      }
+    });
+    try {
+      await withProxy(mock.port, true, async (p) => {
+        const r1 = await post(p, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
+        assert.equal(r1.status, 200);
+        assert.ok(mock.getCalls() >= 4, `expected >=4 upstream calls, got ${mock.getCalls()}`);
+        // pool NOT cooled down: second request succeeds immediately
+        const before = mock.getCalls();
+        const r2 = await post(p, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
+        assert.equal(r2.status, 200);
+        assert.ok(mock.getCalls() > before);
+      });
+    } finally {
+      mock.mockUpstream.close();
+    }
+  });
+});
+
+// ── Pool provider: persistent 529 surfaces 529 (not misleading 502) ──
+test('529 overload persists: surfaces 529, pool not frozen', async () => {
+  await withFastBackoff(async () => {
+    const mock = await startMock((res) => {
+      res.writeHead(529, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', code: '1305', message: 'busy' } }));
+    });
+    try {
+      await withProxy(mock.port, true, async (p) => {
+        const r1 = await post(p, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
+        assert.equal(r1.status, 529);
+        assert.ok(mock.getCalls() > 1, `expected retries, got ${mock.getCalls()}`);
+      });
+    } finally {
+      mock.mockUpstream.close();
+    }
+  });
+});
+
+// ── Single-key provider (ark/deepseek/gpt/claude): 502 then recover ──
 test('502 on single-key provider: proxy backoff-retries → 200', async () => {
-  const mock = await startSingleKeyMock((_req, res, call) => {
-    if (call <= 2) {
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Bad Gateway' } }));
-    } else {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(OK_BODY);
+  await withFastBackoff(async () => {
+    const mock = await startMock((res, call) => {
+      if (call <= 2) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Bad Gateway' } }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(OK_BODY);
+      }
+    });
+    try {
+      await withProxy(mock.port, false, async (p) => {
+        const r1 = await post(p, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
+        assert.equal(r1.status, 200);
+        assert.ok(mock.getCalls() >= 3, `expected >=3 upstream calls, got ${mock.getCalls()}`);
+      });
+    } finally {
+      mock.mockUpstream.close();
     }
   });
-  const ctx = ctxFor(mock.port);
-  const server = createProxyServer(ctx);
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  const port = (server.address() as any).port;
-  try {
-    const r1 = await post(port, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
-    assert.equal(r1.status, 200);
-    assert.ok(mock.getCalls() >= 3, `expected >=3 upstream calls after backoff, got ${mock.getCalls()}`);
-  } finally {
-    server.close();
-    mock.mockUpstream.close();
-  }
 });
 
+// ── Single-key provider: connection reset (network error) then recover ──
 test('network error (connection reset) on single-key provider: proxy backoff-retries → 200', async () => {
-  const mock = await startSingleKeyMock((_req, res, call) => {
-    if (call <= 2) {
-      // Simulate the upstream dropping the connection mid-request.
-      (res as any).socket?.destroy();
-    } else {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(OK_BODY);
+  await withFastBackoff(async () => {
+    const mock = await startMock((res, call) => {
+      if (call <= 2) {
+        (res as any).socket?.destroy(); // simulate dropped connection
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(OK_BODY);
+      }
+    });
+    try {
+      await withProxy(mock.port, false, async (p) => {
+        const r1 = await post(p, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
+        assert.equal(r1.status, 200);
+        assert.ok(mock.getCalls() >= 3, `expected >=3 upstream calls, got ${mock.getCalls()}`);
+      });
+    } finally {
+      mock.mockUpstream.close();
     }
   });
-  const ctx = ctxFor(mock.port);
-  const server = createProxyServer(ctx);
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
-  const port = (server.address() as any).port;
-  try {
-    const r1 = await post(port, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
-    assert.equal(r1.status, 200);
-    assert.ok(mock.getCalls() >= 3, `expected >=3 upstream calls after network backoff, got ${mock.getCalls()}`);
-  } finally {
-    server.close();
-    mock.mockUpstream.close();
-  }
+});
+
+// ── Retry-After header on 529 is honored (proxy still recovers) ──
+test('529 with Retry-After header: proxy still retries to 200', async () => {
+  await withFastBackoff(async () => {
+    const mock = await startMock((res, call) => {
+      if (call <= 2) {
+        res.writeHead(529, { 'Content-Type': 'application/json', 'Retry-After': '0' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'overloaded_error', code: '1305', message: 'busy' } }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(OK_BODY);
+      }
+    });
+    try {
+      await withProxy(mock.port, false, async (p) => {
+        const r1 = await post(p, '/v1/messages', { 'Content-Type': 'application/json', 'x-api-key': 'test' }, REQ_BODY);
+        assert.equal(r1.status, 200);
+        assert.ok(mock.getCalls() >= 3);
+      });
+    } finally {
+      mock.mockUpstream.close();
+    }
+  });
 });

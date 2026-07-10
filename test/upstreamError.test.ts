@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatFetchError, fetchUpstream, isTransientServerError } from '../src/proxy';
+import { formatFetchError, fetchUpstream, isTransientServerError, parseRetryAfterMs } from '../src/proxy';
 
 // ── formatFetchError: the fix for the "Upstream request failed: unknown" hole ──
 //
@@ -117,4 +117,26 @@ test('isTransientServerError: plain 500 / 429 / 400 / 200 are NOT transient', ()
 
 test('isTransientServerError: overloaded_error in body matches even on odd status', () => {
   assert.equal(isTransientServerError(500, '{"error":{"type":"overloaded_error"}}'), true);
+});
+
+// ── parseRetryAfterMs: honoring the upstream Retry-After hint ──
+
+test('parseRetryAfterMs: null/empty → null', () => {
+  assert.equal(parseRetryAfterMs(null), null);
+  assert.equal(parseRetryAfterMs(''), null);
+});
+
+test('parseRetryAfterMs: delta-seconds → ms', () => {
+  assert.equal(parseRetryAfterMs('5'), 5000);
+  assert.equal(parseRetryAfterMs('0'), 0);
+});
+
+test('parseRetryAfterMs: garbage → null', () => {
+  assert.equal(parseRetryAfterMs('not-a-number'), null);
+});
+
+test('parseRetryAfterMs: HTTP-date in future → positive ms', () => {
+  const future = new Date(Date.now() + 10_000).toUTCString();
+  const ms = parseRetryAfterMs(future);
+  assert.ok(ms !== null && ms > 5000 && ms <= 10_000, `expected ~10s, got ${ms}`);
 });

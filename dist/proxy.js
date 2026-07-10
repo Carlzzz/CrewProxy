@@ -38,6 +38,7 @@ exports.formatSSEEvent = formatSSEEvent;
 exports.fetchUpstream = fetchUpstream;
 exports.formatFetchError = formatFetchError;
 exports.isTransientServerError = isTransientServerError;
+exports.parseRetryAfterMs = parseRetryAfterMs;
 exports.createProxyServer = createProxyServer;
 const http = __importStar(require("http"));
 const logger_1 = require("./logger");
@@ -172,13 +173,47 @@ function isTransientServerError(status, errText) {
         return true;
     return errText.includes('overloaded_error');
 }
-/** Backoff schedule for transient-error retries on the SAME credential
- *  (overload + gateway + network). Tuned so a sub-second-to-few-seconds
- *  upstream blip is absorbed transparently for the client. */
-const TRANSIENT_MAX_RETRIES = 4;
-const TRANSIENT_BACKOFF_BASE_MS = 300;
-const TRANSIENT_BACKOFF_STEP_MS = 250; // added per retry round (linear backoff)
-const TRANSIENT_BACKOFF_JITTER_MS = 500;
+/** Transient-error backoff: exponential (base * 2^round), capped, with ±20%
+ *  jitter to avoid thundering-herd retries. Tuned AGGRESSIVE (7 rounds, cap
+ *  15s → ~60s total) so a GLM model-wide overload spike (code 1305 "访问量过大")
+ *  — which clears in tens of seconds — is waited out, matching the behavior of
+ *  Anthropic's own SDK (auto-retry 529 with exponential backoff). The old
+ *  linear 4-round ~4s backoff gave up before GLM recovered. Override via env
+ *  for testing. */
+function readPositiveIntEnv(name, def) {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '')
+        return def;
+    const v = Number.parseInt(raw, 10);
+    return Number.isFinite(v) && v > 0 ? v : def;
+}
+function transientMaxRetries() {
+    return readPositiveIntEnv('WOICLAW_TRANSIENT_MAX_RETRIES', 7);
+}
+/** Backoff (ms) for a given round, honoring a Retry-After hint if present. */
+function transientBackoffMs(round, retryAfterMs) {
+    const base = readPositiveIntEnv('WOICLAW_TRANSIENT_BASE_MS', 1000);
+    const cap = readPositiveIntEnv('WOICLAW_TRANSIENT_CAP_MS', 15000);
+    const exp = base * 2 ** round;
+    return Math.min(Math.max(exp, retryAfterMs), cap);
+}
+/** Sleep one exponential-backoff round with ±20% jitter. */
+function sleepTransientBackoff(round, retryAfterMs) {
+    const target = transientBackoffMs(round, retryAfterMs);
+    return sleepWithJitter(Math.round(target * 0.8), Math.round(target * 0.4));
+}
+/** Parse an HTTP Retry-After header (delta-seconds or HTTP-date) → ms. */
+function parseRetryAfterMs(val) {
+    if (!val)
+        return null;
+    const s = Number.parseInt(val, 10);
+    if (Number.isFinite(s))
+        return s * 1000;
+    const d = Date.parse(val);
+    if (Number.isFinite(d))
+        return Math.max(0, d - Date.now());
+    return null;
+}
 // ─── Request body reader ───
 function readRequestBody(req) {
     return new Promise((resolve, reject) => {
@@ -921,9 +956,10 @@ async function handleRequest(req, res, ctx) {
         // a momentary blip into a 30s outage.
         if (!upstreamResponse) {
             let recovered = false;
-            for (let r = 0; r < TRANSIENT_MAX_RETRIES; r++) {
-                await sleepWithJitter(TRANSIENT_BACKOFF_BASE_MS + r * TRANSIENT_BACKOFF_STEP_MS, TRANSIENT_BACKOFF_JITTER_MS);
-                logger_1.logger.verbose(`[${reqId}] Network error (${formatFetchError(lastError).summary}), backoff retry ${r + 1}/${TRANSIENT_MAX_RETRIES}`);
+            const maxRetries = transientMaxRetries();
+            for (let r = 0; r < maxRetries; r++) {
+                await sleepTransientBackoff(r, 0);
+                logger_1.logger.verbose(`[${reqId}] Network error (${formatFetchError(lastError).summary}), backoff retry ${r + 1}/${maxRetries}`);
                 try {
                     const retryResp = await fetchUpstream(targetURLs[targetURLs.length - 1], {
                         method: 'POST',
@@ -977,9 +1013,11 @@ async function handleRequest(req, res, ctx) {
         if (isTransientServerError(upstreamResponse.status, errText)) {
             let recovered = false;
             let changedToNonTransient = false;
-            for (let r = 0; r < TRANSIENT_MAX_RETRIES; r++) {
-                await sleepWithJitter(TRANSIENT_BACKOFF_BASE_MS + r * TRANSIENT_BACKOFF_STEP_MS, TRANSIENT_BACKOFF_JITTER_MS);
-                logger_1.logger.verbose(`[${reqId}] Upstream transient ${lastUpstreamStatus}, backoff retry ${r + 1}/${TRANSIENT_MAX_RETRIES}`);
+            const retryAfterMs = parseRetryAfterMs(upstreamResponse.headers.get('retry-after')) ?? 0;
+            const maxRetries = transientMaxRetries();
+            for (let r = 0; r < maxRetries; r++) {
+                await sleepTransientBackoff(r, retryAfterMs);
+                logger_1.logger.verbose(`[${reqId}] Upstream transient ${lastUpstreamStatus}, backoff retry ${r + 1}/${maxRetries}`);
                 try {
                     const retryResp = await fetchUpstream(targetURLs[targetURLs.length - 1], {
                         method: 'POST',
@@ -1018,7 +1056,7 @@ async function handleRequest(req, res, ctx) {
             if (!changedToNonTransient) {
                 // Still transient after all backoffs: surface it WITHOUT cooldown so
                 // the client can retry immediately once the provider recovers.
-                logger_1.logger.verbose(`[${reqId}] Upstream still transient ${lastUpstreamStatus} after ${TRANSIENT_MAX_RETRIES} backoffs; surfacing without cooldown`);
+                logger_1.logger.verbose(`[${reqId}] Upstream still transient ${lastUpstreamStatus} after ${maxRetries} backoffs; surfacing without cooldown`);
                 break;
             }
             // else: error changed during backoff → fall through to normal handling
