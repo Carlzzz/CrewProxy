@@ -132,6 +132,8 @@ function appendUsageLog(clientid, modelid, startTime, inputToken, outputToken, e
                 input_fulltext: e?.input_fulltext ?? null,
                 session_id: e?.session_id !== undefined ? e.session_id : null,
                 routing_key: e?.routing_key ?? null,
+                status: e?.status ?? null,
+                error: e?.error ?? null,
             };
             fs.appendFileSync(filePath, `${JSON.stringify(record)}\n`, 'utf8');
         }

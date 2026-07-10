@@ -35,6 +35,8 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createAnthropicErrorBody = createAnthropicErrorBody;
 exports.formatSSEEvent = formatSSEEvent;
+exports.fetchUpstream = fetchUpstream;
+exports.formatFetchError = formatFetchError;
 exports.createProxyServer = createProxyServer;
 const http = __importStar(require("http"));
 const logger_1 = require("./logger");
@@ -103,6 +105,58 @@ function sendJSONResponse(res, statusCode, body) {
 }
 function sendErrorResponse(res, statusCode, message, errorType) {
     sendJSONResponse(res, statusCode, createAnthropicErrorBody(message, errorType));
+}
+/** Connect + first-byte timeout for upstream LLM calls. The timer is cleared
+ *  as soon as `fetch` resolves (response headers arrived), so streaming
+ *  response bodies are NOT cut by this — only the "connect and wait for first
+ *  byte" phase. GLM coding-plan upstreams occasionally stall there with no
+ *  response at all, which previously hung the request indefinitely. */
+const UPSTREAM_TIMEOUT_MS = 60_000;
+async function fetchUpstream(url, init, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, { ...init, signal: controller.signal });
+    }
+    catch (err) {
+        // Translate our own abort into a clear timeout message so the failure log
+        // (and the 502 body) shows "timeout" instead of an opaque AbortError.
+        if (controller.signal.aborted) {
+            throw new Error(`upstream timeout after ${timeoutMs}ms: ${url}`);
+        }
+        throw err;
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
+function safeCauseString(cause) {
+    try {
+        if (cause instanceof Error) {
+            const c = cause.code;
+            return c ? `${c}: ${cause.message}` : cause.message;
+        }
+        const s = JSON.stringify(cause);
+        return typeof s === 'string' ? s : String(cause);
+    }
+    catch {
+        return String(cause);
+    }
+}
+/** Extract the useful signal from a fetch/abort error. undici network errors
+ *  put the reason in `.code` (ECONNRESET, ETIMEDOUT, UND_ERR_*) or nested
+ *  `.cause`, NOT in `.message` — which is exactly why the old code surfaced
+ *  "Upstream request failed: unknown". */
+function formatFetchError(err) {
+    if (!err) {
+        return { code: null, message: '', cause: null, summary: 'unknown (no response and no error captured)' };
+    }
+    const code = err?.code ?? err?.name ?? null;
+    const message = typeof err?.message === 'string' && err.message ? err.message : '';
+    const cause = err?.cause !== undefined && err.cause !== null ? safeCauseString(err.cause) : null;
+    const parts = [code, message].filter(Boolean);
+    const summary = parts.length ? parts.join(': ') : 'unknown';
+    return { code, message, cause, summary };
 }
 // ─── Request body reader ───
 function readRequestBody(req) {
@@ -555,6 +609,7 @@ async function handleAnthropicStreamResponse(upstreamResponse, req, res, clientI
         const outputContent = state.outputAccumulator.join('');
         (0, usageLogger_1.appendUsageLog)(clientId, modelId, startTime, state.inputTokens, state.outputTokens, {
             ...extra,
+            status: 200,
             input_cached_token: state.cachedInputTokens,
             input_content: inputContent,
             output_content: outputContent,
@@ -715,6 +770,14 @@ async function handleRequest(req, res, ctx) {
     // On 400 token errors: try trim first, then switch credential if still failing.
     let upstreamResponse = null;
     let lastError = null;
+    // Track the last real upstream status across credential attempts. When the
+    // pool is exhausted (pickOrFallback returns null) the loop breaks WITHOUT a
+    // fetch on the final iteration, leaving upstreamResponse=null. We remember
+    // the last status we actually saw so we can surface the truth (e.g. a 429)
+    // instead of a misleading "502 unknown".
+    let lastUpstreamStatus = null;
+    let lastUpstreamErrText = '';
+    let exhaustedAllCredentials = false;
     let pickedCredentialId = null;
     let effectiveApiKey = upstream.apiKey;
     let effectiveBaseURL = upstream.baseURL;
@@ -753,10 +816,13 @@ async function handleRequest(req, res, ctx) {
             }
             else if (ordinaryKeyIsPooled) {
                 // **Fix #1 active path**: all pool keys are in cooldown and the ordinary
-                // key is a duplicate of one of them. Hitting it again would just bounce
-                // off the same rate limit. Surface the upstream 429 to the caller.
+                // key is a duplicate of one of them (or empty, as with GLM). Hitting it
+                // again would just bounce off the same rate limit. Break and let the
+                // final-error check below surface the LAST real upstream status (e.g.
+                // the 429 that cooled the keys) — not a misleading "502 unknown".
                 logger_1.logger.verbose(`[${reqId}] CodePlan: all credentials exhausted; ordinary key matches a pooled credential, skipping fallback`);
                 pickedCredentialId = null;
+                exhaustedAllCredentials = true;
                 break;
             }
             else {
@@ -804,7 +870,7 @@ async function handleRequest(req, res, ctx) {
         for (const targetURL of targetURLs) {
             logger_1.logger.verbose(`[${reqId}] Fetching: ${targetURL}`);
             try {
-                upstreamResponse = await fetch(targetURL, {
+                upstreamResponse = await fetchUpstream(targetURL, {
                     method: 'POST',
                     headers: upstreamHeaders,
                     body: JSON.stringify(upstreamRequestBody),
@@ -846,19 +912,30 @@ async function handleRequest(req, res, ctx) {
         }
         catch { }
         logger_1.logger.verbose(`[${reqId}] Upstream error ${upstreamResponse.status}:`, errText.substring(0, 500));
+        // Remember the last real upstream status/error so that if the pool is
+        // later exhausted (break without a final fetch) we can surface this truth
+        // (e.g. a 429) instead of a misleading "502 unknown".
+        lastUpstreamStatus = upstreamResponse.status;
+        lastUpstreamErrText = errText;
         // ── Token trimming (per credential attempt) ──
         if (upstreamResponse.status === 400 && !usedOrdinaryFallback) {
             // Try clamping max_tokens if the error suggests a limit
             if (clampMaxTokensFromAnthropicError(errText, upstreamRequestBody)) {
-                const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
-                    method: 'POST',
-                    headers: upstreamHeaders,
-                    body: JSON.stringify(upstreamRequestBody),
-                });
-                if (retryResp.ok || retryResp.status !== 400) {
-                    upstreamResponse = retryResp;
-                    logger_1.logger.verbose(`[${reqId}] CodePlan success after max_tokens clamp (attempt=${credAttempt})`);
-                    break;
+                try {
+                    const retryResp = await fetchUpstream(targetURLs[targetURLs.length - 1], {
+                        method: 'POST',
+                        headers: upstreamHeaders,
+                        body: JSON.stringify(upstreamRequestBody),
+                    });
+                    if (retryResp.ok || retryResp.status !== 400) {
+                        upstreamResponse = retryResp;
+                        logger_1.logger.verbose(`[${reqId}] CodePlan success after max_tokens clamp (attempt=${credAttempt})`);
+                        break;
+                    }
+                }
+                catch (retryErr) {
+                    lastError = retryErr;
+                    logger_1.logger.error(`[${reqId}] max_tokens clamp retry fetch failed:`, retryErr);
                 }
             }
             // Token-exceed retry loop
@@ -869,17 +946,26 @@ async function handleRequest(req, res, ctx) {
                     break;
                 upstreamRequestBody = (0, contextBudget_1.aggressiveTrimForRetry)(upstreamRequestBody, trimRound);
                 logger_1.logger.verbose(`[${reqId}] Token exceed error, retry round ${trimRound + 1}/3 with aggressively trimmed context`);
-                const retryResp = await fetch(targetURLs[targetURLs.length - 1], {
-                    method: 'POST',
-                    headers: upstreamHeaders,
-                    body: JSON.stringify(upstreamRequestBody),
-                });
-                upstreamResponse = retryResp;
-                if (!upstreamResponse.ok) {
-                    try {
-                        errText = await upstreamResponse.clone().text();
+                try {
+                    const retryResp = await fetchUpstream(targetURLs[targetURLs.length - 1], {
+                        method: 'POST',
+                        headers: upstreamHeaders,
+                        body: JSON.stringify(upstreamRequestBody),
+                    });
+                    upstreamResponse = retryResp;
+                    if (!upstreamResponse.ok) {
+                        try {
+                            errText = await upstreamResponse.clone().text();
+                        }
+                        catch { }
+                        lastUpstreamStatus = upstreamResponse.status;
+                        lastUpstreamErrText = errText;
                     }
-                    catch { }
+                }
+                catch (retryErr) {
+                    lastError = retryErr;
+                    logger_1.logger.error(`[${reqId}] token-trim retry fetch failed:`, retryErr);
+                    break;
                 }
             }
             if (upstreamResponse && upstreamResponse.ok) {
@@ -943,7 +1029,26 @@ async function handleRequest(req, res, ctx) {
         // ── Final error check ──
         if (!upstreamResponse) {
             recordMetric(false, 0, 0);
-            sendErrorResponse(res, 502, `Upstream request failed: ${lastError?.message || 'unknown'}`, 'api_error');
+            if (exhaustedAllCredentials && lastUpstreamStatus !== null) {
+                // All pooled credentials were exhausted (typically every key hit a
+                // burst/quota 429 and entered cooldown, so pickOrFallback returned
+                // null and the loop broke without a final fetch). Surface the LAST
+                // real upstream status so the client can back off correctly —
+                // previously this always returned a misleading "502 unknown".
+                const msg = `All code-plan credentials exhausted (last upstream ${lastUpstreamStatus}): ${lastUpstreamErrText.substring(0, 200)}`;
+                sendErrorResponse(res, lastUpstreamStatus, msg, 'api_error');
+                (0, usageLogger_1.appendUsageLog)(clientId, effectiveModel, startTime, 0, 0, { ...usageExtra, status: lastUpstreamStatus, error: msg });
+            }
+            else {
+                // Network-level failure on every attempt: extract the real reason from
+                // lastError (undici .code / .cause, or our own timeout message) instead
+                // of the old opaque "unknown".
+                const errInfo = formatFetchError(lastError);
+                const msg = `Upstream request failed: ${errInfo.summary}`;
+                sendErrorResponse(res, 502, msg, 'api_error');
+                const detail = errInfo.cause ? `${msg} | cause: ${errInfo.cause}` : msg;
+                (0, usageLogger_1.appendUsageLog)(clientId, effectiveModel, startTime, 0, 0, { ...usageExtra, status: 502, error: detail });
+            }
             return;
         }
         if (!upstreamResponse.ok) {
@@ -953,7 +1058,9 @@ async function handleRequest(req, res, ctx) {
             }
             catch { }
             recordMetric(false, 0, 0);
-            sendErrorResponse(res, upstreamResponse.status, `Upstream error: ${errText.substring(0, 200)}`, 'api_error');
+            const msg = `Upstream error: ${errText.substring(0, 200)}`;
+            sendErrorResponse(res, upstreamResponse.status, msg, 'api_error');
+            (0, usageLogger_1.appendUsageLog)(clientId, effectiveModel, startTime, 0, 0, { ...usageExtra, status: upstreamResponse.status, error: msg });
             return;
         }
         if (parsedBody.stream) {
@@ -978,6 +1085,7 @@ async function handleRequest(req, res, ctx) {
         const outputTokens = respUsage.output_tokens ?? respUsage.completion_tokens ?? 0;
         (0, usageLogger_1.appendUsageLog)(clientId, effectiveModel, startTime, inputTokens, outputTokens, {
             ...usageExtra,
+            status: 200,
             input_cached_token: extractCachedInputTokensFromUsage(anthropicResp.usage),
             input_content: inputContent,
             output_content: outputContent,
