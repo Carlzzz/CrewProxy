@@ -37,6 +37,7 @@ exports.createAnthropicErrorBody = createAnthropicErrorBody;
 exports.formatSSEEvent = formatSSEEvent;
 exports.fetchUpstream = fetchUpstream;
 exports.formatFetchError = formatFetchError;
+exports.isTransientServerError = isTransientServerError;
 exports.createProxyServer = createProxyServer;
 const http = __importStar(require("http"));
 const logger_1 = require("./logger");
@@ -158,6 +159,26 @@ function formatFetchError(err) {
     const summary = parts.length ? parts.join(': ') : 'unknown';
     return { code, message, cause, summary };
 }
+/** Provider-side transient failure where retrying the SAME key makes sense
+ *  and cooling down would only amplify a momentary blip:
+ *    529 / 503 — overload (GLM "访问量过大" code 1305, Anthropic overloaded_error)
+ *    502 / 504 — gateway error / upstream timeout, almost always transient
+ *  500 is intentionally excluded (often a persistent request-side fault), as
+ *  are 4xx (client errors — retrying won't help). These MUST NOT cool down the
+ *  key: for overload every key sees the same condition, and for gateway errors
+ *  freezing the pool extends a sub-second blip into a 30s outage. */
+function isTransientServerError(status, errText) {
+    if (status === 529 || status === 503 || status === 502 || status === 504)
+        return true;
+    return errText.includes('overloaded_error');
+}
+/** Backoff schedule for transient-error retries on the SAME credential
+ *  (overload + gateway + network). Tuned so a sub-second-to-few-seconds
+ *  upstream blip is absorbed transparently for the client. */
+const TRANSIENT_MAX_RETRIES = 4;
+const TRANSIENT_BACKOFF_BASE_MS = 300;
+const TRANSIENT_BACKOFF_STEP_MS = 250; // added per retry round (linear backoff)
+const TRANSIENT_BACKOFF_JITTER_MS = 500;
 // ─── Request body reader ───
 function readRequestBody(req) {
     return new Promise((resolve, reject) => {
@@ -892,18 +913,47 @@ async function handleRequest(req, res, ctx) {
             logger_1.logger.verbose(`[${reqId}] CodePlan success with credential=${pickedCredentialId} (attempt=${credAttempt})`);
             break;
         }
-        // ── Network error (no response) — mark cooldown and retry ──
+        // ── Network error (no response) — transient, backoff-retry same key ──
+        // A thrown fetch (ECONNRESET / connect timeout / TLS reset / our own 60s
+        // timeout) is almost always a sub-second blip. For ALL providers we
+        // backoff-retry the SAME credential before giving up. We do NOT cooldown:
+        // the key isn't bad, and freezing the pool (the old behavior) would extend
+        // a momentary blip into a 30s outage.
         if (!upstreamResponse) {
-            if (pickedCredentialId !== null && !usedOrdinaryFallback) {
-                // Network errors are usually transient; short cooldown is sufficient.
-                ctx.codePlanPool?.markCooldown(codePlanPoolKey, pickedCredentialId, codePlanPool_1.CODE_PLAN_SHORT_COOLDOWN_MS, 'network');
-                logger_1.logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId} after network error, retrying with next credential`);
-                await sleepWithJitter(50, 150);
-                upstreamRequestBody = structuredClone(pristineRequestBody);
-                continue;
+            let recovered = false;
+            for (let r = 0; r < TRANSIENT_MAX_RETRIES; r++) {
+                await sleepWithJitter(TRANSIENT_BACKOFF_BASE_MS + r * TRANSIENT_BACKOFF_STEP_MS, TRANSIENT_BACKOFF_JITTER_MS);
+                logger_1.logger.verbose(`[${reqId}] Network error (${formatFetchError(lastError).summary}), backoff retry ${r + 1}/${TRANSIENT_MAX_RETRIES}`);
+                try {
+                    const retryResp = await fetchUpstream(targetURLs[targetURLs.length - 1], {
+                        method: 'POST',
+                        headers: upstreamHeaders,
+                        body: JSON.stringify(upstreamRequestBody),
+                    });
+                    upstreamResponse = retryResp;
+                    if (retryResp.ok) {
+                        recovered = true;
+                        logger_1.logger.verbose(`[${reqId}] Recovered after network-error backoff (round ${r + 1})`);
+                        break;
+                    }
+                    // A real response appeared (possibly a transient 5xx) → stop
+                    // network-retrying and let the non-ok handling below deal with it.
+                    break;
+                }
+                catch (retryErr) {
+                    lastError = retryErr;
+                    // still no response — keep backing off
+                }
             }
-            // Ordinary key failed with network error — no more fallbacks
-            break;
+            if (recovered)
+                break; // success → exit main loop
+            if (!upstreamResponse) {
+                // Still no response after all backoffs: surface 502 with the real
+                // error. No cooldown — pool stays usable for the client's retry.
+                break;
+            }
+            // else: a response appeared during backoff → fall through to non-ok
+            // handling (which may itself backoff-retry if it's a transient 5xx).
         }
         // ── Non-ok response ──
         let errText = '';
@@ -917,6 +967,62 @@ async function handleRequest(req, res, ctx) {
         // (e.g. a 429) instead of a misleading "502 unknown".
         lastUpstreamStatus = upstreamResponse.status;
         lastUpstreamErrText = errText;
+        // ── Transient server error (502/503/504/529/overloaded): NOT per-key ──
+        // GLM surfaces model-wide congestion as 529 code 1305 "访问量过大";
+        // gateways return 502/504 on momentary upstream faults. Switching keys is
+        // pointless (every key sees the same condition) and cooldown-ing would
+        // freeze the pool long after the provider recovers (seconds). Retry the
+        // SAME credential with jittered backoff so a transient spike is transparent
+        // to the client; the pool is left un-cooled-down either way.
+        if (isTransientServerError(upstreamResponse.status, errText)) {
+            let recovered = false;
+            let changedToNonTransient = false;
+            for (let r = 0; r < TRANSIENT_MAX_RETRIES; r++) {
+                await sleepWithJitter(TRANSIENT_BACKOFF_BASE_MS + r * TRANSIENT_BACKOFF_STEP_MS, TRANSIENT_BACKOFF_JITTER_MS);
+                logger_1.logger.verbose(`[${reqId}] Upstream transient ${lastUpstreamStatus}, backoff retry ${r + 1}/${TRANSIENT_MAX_RETRIES}`);
+                try {
+                    const retryResp = await fetchUpstream(targetURLs[targetURLs.length - 1], {
+                        method: 'POST',
+                        headers: upstreamHeaders,
+                        body: JSON.stringify(upstreamRequestBody),
+                    });
+                    upstreamResponse = retryResp;
+                    if (retryResp.ok) {
+                        recovered = true;
+                        logger_1.logger.verbose(`[${reqId}] Recovered after transient backoff (round ${r + 1})`);
+                        break;
+                    }
+                    let nextErr = '';
+                    try {
+                        nextErr = await retryResp.clone().text();
+                    }
+                    catch { }
+                    errText = nextErr;
+                    lastUpstreamStatus = retryResp.status;
+                    lastUpstreamErrText = nextErr;
+                    if (!isTransientServerError(retryResp.status, nextErr)) {
+                        // Morphed into a non-transient failure — stop spending backoff
+                        // retries and let the normal flow below handle it (cooldown/switch).
+                        changedToNonTransient = true;
+                        break;
+                    }
+                }
+                catch (retryErr) {
+                    lastError = retryErr;
+                    logger_1.logger.error(`[${reqId}] transient backoff retry fetch failed:`, retryErr);
+                    break;
+                }
+            }
+            if (recovered)
+                break; // success → exit main loop
+            if (!changedToNonTransient) {
+                // Still transient after all backoffs: surface it WITHOUT cooldown so
+                // the client can retry immediately once the provider recovers.
+                logger_1.logger.verbose(`[${reqId}] Upstream still transient ${lastUpstreamStatus} after ${TRANSIENT_MAX_RETRIES} backoffs; surfacing without cooldown`);
+                break;
+            }
+            // else: error changed during backoff → fall through to normal handling
+        }
         // ── Token trimming (per credential attempt) ──
         if (upstreamResponse.status === 400 && !usedOrdinaryFallback) {
             // Try clamping max_tokens if the error suggests a limit

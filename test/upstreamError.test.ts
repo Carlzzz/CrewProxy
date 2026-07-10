@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formatFetchError, fetchUpstream } from '../src/proxy';
+import { formatFetchError, fetchUpstream, isTransientServerError } from '../src/proxy';
 
 // ── formatFetchError: the fix for the "Upstream request failed: unknown" hole ──
 //
@@ -92,4 +92,29 @@ test('fetchUpstream clears the timer once headers arrive (no abort leak on succe
   } finally {
     globalThis.fetch = origFetch;
   }
+});
+
+// ── isTransientServerError: gate for the "don't cool down, backoff-retry" path ──
+
+test('isTransientServerError: 529/503/502/504 are transient regardless of body', () => {
+  for (const s of [529, 503, 502, 504]) {
+    assert.equal(isTransientServerError(s, ''), true);
+    assert.equal(isTransientServerError(s, 'anything'), true);
+  }
+});
+
+test('isTransientServerError: real GLM 1305 body matches', () => {
+  const glm = '{"type":"error","error":{"type":"overloaded_error","code":"1305","message":"[1305][该模型当前访问量过大，请您稍后再试]"}}';
+  assert.equal(isTransientServerError(529, glm), true);
+});
+
+test('isTransientServerError: plain 500 / 429 / 400 / 200 are NOT transient', () => {
+  assert.equal(isTransientServerError(500, ''), false); // 500 excluded — may be persistent
+  assert.equal(isTransientServerError(429, 'rate limit'), false); // 429 has its own handling
+  assert.equal(isTransientServerError(400, 'max_tokens too large'), false);
+  assert.equal(isTransientServerError(200, ''), false);
+});
+
+test('isTransientServerError: overloaded_error in body matches even on odd status', () => {
+  assert.equal(isTransientServerError(500, '{"error":{"type":"overloaded_error"}}'), true);
 });

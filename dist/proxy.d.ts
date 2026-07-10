@@ -19,5 +19,14 @@ interface UpstreamErrorInfo {
  *  `.cause`, NOT in `.message` — which is exactly why the old code surfaced
  *  "Upstream request failed: unknown". */
 export declare function formatFetchError(err: any): UpstreamErrorInfo;
+/** Provider-side transient failure where retrying the SAME key makes sense
+ *  and cooling down would only amplify a momentary blip:
+ *    529 / 503 — overload (GLM "访问量过大" code 1305, Anthropic overloaded_error)
+ *    502 / 504 — gateway error / upstream timeout, almost always transient
+ *  500 is intentionally excluded (often a persistent request-side fault), as
+ *  are 4xx (client errors — retrying won't help). These MUST NOT cool down the
+ *  key: for overload every key sees the same condition, and for gateway errors
+ *  freezing the pool extends a sub-second blip into a 30s outage. */
+export declare function isTransientServerError(status: number, errText: string): boolean;
 export declare function createProxyServer(ctx: ProxyRuntimeContext): http.Server;
 export {};
