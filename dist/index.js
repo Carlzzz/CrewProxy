@@ -70,8 +70,37 @@ ctx.tokenUsage = tokenUsage;
 function buildQuotaUpstreams(cfg) {
     const out = [];
     const collect = (upstreamId, u) => {
-        if (!u || !u.codePlanCredentials)
+        if (!u)
             return;
+        // Volcengine (火山方舟) quota is account-level (one AK/SK), queried via
+        // control-plane OpenAPI rather than a per-key data-plane balance endpoint.
+        // Such upstreams have no codePlanCredentials pool, so synthesize a single
+        // 'account' credential carrying the AK/SK when they're configured.
+        if (u.accessKeyId && u.secretAccessKey && !u.codePlanCredentials?.length) {
+            out.push({
+                upstreamId,
+                quotaMode: 'fetch',
+                quotaLimits: u.quotaLimits,
+                credentials: [{ upstreamId, credentialId: 'account', apiKey: u.apiKey, baseURL: u.baseURL, accessKeyId: u.accessKeyId, secretAccessKey: u.secretAccessKey }],
+            });
+            return;
+        }
+        if (!u.codePlanCredentials?.length) {
+            // Account-level balance providers (e.g. DeepSeek pay-as-you-go) have no
+            // credential pool — just a single upstream apiKey. Synthesize an 'account'
+            // credential so their balance still shows on the dashboard. Gated to
+            // balance providers so quota-type upstreams (GLM/MiniMax) configured only
+            // via a bare default apiKey aren't silently pulled into official-API polling.
+            if (u.apiKey && (0, quotaFetcher_1.detectQuotaProvider)(u.baseURL) === 'deepseek') {
+                out.push({
+                    upstreamId,
+                    quotaMode: 'fetch',
+                    quotaLimits: u.quotaLimits,
+                    credentials: [{ upstreamId, credentialId: 'account', apiKey: u.apiKey, baseURL: u.baseURL }],
+                });
+            }
+            return;
+        }
         const credentials = u.codePlanCredentials
             .filter(c => c.enabled && c.apiKey)
             .map(c => ({ upstreamId, credentialId: c.id, apiKey: c.apiKey, baseURL: u.baseURL }));

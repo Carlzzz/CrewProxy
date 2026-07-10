@@ -1,3 +1,4 @@
+import { createHash, createHmac } from 'crypto';
 import { logger } from './logger';
 import type { TokenUsageTracker } from './tokenUsageTracker';
 
@@ -8,9 +9,18 @@ export interface QuotaTierInfo {
   resetsAt: string | null; // ISO 8601，或 null
 }
 
+export interface BalanceInfo {
+  remaining: number;       // 剩余金额（原生货币单位）
+  total?: number;          // 授信/充值总额（部分供应商无此字段）
+  currency: string;        // 货币单位，如 CNY / USD
+  isValid: boolean;        // 账户是否可用（余额充足）
+}
+
 export interface CredentialQuota {
   fiveHour?: QuotaTierInfo;
   weekly?: QuotaTierInfo;
+  monthly?: QuotaTierInfo;  // 火山方舟按月窗口（GLM/MiniMax 不产出）
+  balance?: BalanceInfo;    // DeepSeek 等按量付费供应商的账户余额（非套餐配额）
   status: QuotaStatus;
   error?: string;
   estimated?: boolean;
@@ -22,6 +32,9 @@ export interface QuotaCredentialRef {
   credentialId: string;
   apiKey: string;
   baseURL: string;
+  // 火山方舟控制面 OpenAPI 用量查询走 AK/SK 签名，与数据面 apiKey 分离。
+  accessKeyId?: string;
+  secretAccessKey?: string;
 }
 
 export interface QuotaUpstreamRef {
@@ -34,11 +47,18 @@ export interface QuotaUpstreamRef {
 const DEFAULT_INTERVAL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 15_000;
 
-/** Detect provider from the data-plane baseURL. Only glm/minimax supported in v1. */
-export function detectQuotaProvider(baseURL: string): 'glm' | 'minimax' | null {
+export type QuotaProvider = 'glm' | 'minimax' | 'volcengine' | 'deepseek';
+
+/** Detect provider from the data-plane baseURL. */
+export function detectQuotaProvider(baseURL: string): QuotaProvider | null {
   const u = baseURL.toLowerCase();
   if (u.includes('bigmodel.cn') || u.includes('z.ai')) return 'glm';
   if (u.includes('minimaxi.com') || u.includes('minimax.io')) return 'minimax';
+  // 仅匹配火山方舟 Coding/Agent Plan 入口（/api/coding）；DouBaoSeed 按量付费走
+  // /api/v3、/api/compatible，无套餐额度，不在此命中。
+  if (u.includes('volces.com/api/coding')) return 'volcengine';
+  // DeepSeek 是按量付费（账户余额），非套餐配额。
+  if (u.includes('api.deepseek.com')) return 'deepseek';
   return null;
 }
 
@@ -103,6 +123,287 @@ export function parseMinimaxTiers(body: any): { fiveHour?: QuotaTierInfo; weekly
 
 function glmQuotaBase(baseURL: string): string {
   return baseURL.toLowerCase().includes('bigmodel.cn') ? 'https://open.bigmodel.cn' : 'https://api.z.ai';
+}
+
+// ── DeepSeek 账户余额 ───────────────────────────────────────
+// GET https://api.deepseek.com/user/balance  (Bearer)
+// Response: { is_available, balance_infos: [{ currency, total_balance, granted_balance, topped_up_balance }] }
+// 与 GLM/MiniMax/火山的“套餐配额百分比”不同，DeepSeek 是按量付费的**账户余额**（原生货币）。
+// 移植自 cc-switch services/balance.rs。
+
+/** 解析 DeepSeek /user/balance 响应为 BalanceInfo（取首个 balance_info）。 */
+export function parseDeepseekBalance(body: any): BalanceInfo | undefined {
+  const infos: any[] = Array.isArray(body?.balance_infos) ? body.balance_infos : [];
+  if (infos.length === 0) return undefined;
+  const isValid = typeof body?.is_available === 'boolean' ? body.is_available : true;
+  // 优先取有余额的币种（多币种时 CNY/USD 可能并存），否则取第一条。
+  const pick = infos.find(i => (asF64(i?.total_balance) ?? 0) > 0) ?? infos[0];
+  const currency = typeof pick?.currency === 'string' ? pick.currency : 'CNY';
+  return {
+    remaining: asF64(pick?.total_balance) ?? 0,
+    currency,
+    isValid,
+  };
+}
+
+async function queryDeepseek(ref: QuotaCredentialRef, fetchImpl: typeof fetch): Promise<CredentialQuota> {
+  if (!ref.apiKey.trim()) return { status: 'not_configured', error: 'API key is empty', queriedAt: Date.now() };
+  const resp = await fetchImpl('https://api.deepseek.com/user/balance', {
+    method: 'GET',
+    headers: { 'Authorization': `Bearer ${ref.apiKey}`, 'Accept': 'application/json' },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (resp.status === 401 || resp.status === 403) return { status: 'expired', queriedAt: Date.now() };
+  if (!resp.ok) { logger.verbose(`[quota] DeepSeek non-2xx ${resp.status} for ${ref.upstreamId}`); return { status: 'error', error: `DeepSeek HTTP ${resp.status}`, queriedAt: Date.now() }; }
+  const body: any = await resp.json();
+  const balance = parseDeepseekBalance(body);
+  if (!balance) return { status: 'error', error: 'DeepSeek: missing balance_infos', queriedAt: Date.now() };
+  return { balance, status: 'ok', queriedAt: Date.now() };
+}
+
+// ── 火山方舟 Agent Plan / Coding Plan ───────────────────────
+//
+// 与 GLM/MiniMax（数据面 Bearer 接口）不同，火山用量接口是**控制面 OpenAPI**：
+// 统一网关 `open.volcengineapi.com`（不是数据面推理域名 ark.cn-beijing.volces.com），
+// 形如 `POST https://open.volcengineapi.com/?Action=...&Version=2024-01-01&Region=cn-beijing`，
+// 强制火山引擎签名 V4（AK/SK）。复用推理 Bearer Key 会被网关以 400 InvalidAuthorization
+// 拒绝，故需另填账号 AccessKey ID + Secret。两个 plan 共用同一份 AK/SK。
+//
+// 自动探测：先调 GetAFPUsage（Agent Plan，回绝对额度 Quota/Used），未订阅再调
+// GetCodingPlanUsage（Coding Plan，回百分比）。移植自 cc-switch coding_plan.rs。
+
+const VOLC_OPENAPI_HOST = 'open.volcengineapi.com';
+const VOLC_API_VERSION = '2024-01-01';
+const VOLC_DEFAULT_REGION = 'cn-beijing';
+const VOLC_SERVICE = 'ark';
+const VOLC_CONTENT_TYPE = 'application/json; charset=utf-8';
+// 火山特有：canonical headers 与 SignedHeaders 用固定顺序（不按字母序）。
+const VOLC_SIGNED_HEADERS = 'host;x-date;x-content-sha256;content-type';
+const VOLC_AKSK_HINT = 'Check the AccessKey ID / Secret and that the account has Ark usage-query (OpenAPI) permission.';
+
+/** 从数据面 base_url 提取控制面 OpenAPI 所需的 Region；无法识别时回落 cn-beijing。 */
+export function volcRegion(baseURL: string): string {
+  const host = baseURL.split('://').pop()?.split('/')[0] ?? '';
+  const seg = host.split('.').find(p => p.startsWith('cn-') || p.startsWith('ap-'));
+  return seg ?? VOLC_DEFAULT_REGION;
+}
+
+/** 从 JSON 值提取重置时间：字符串直返；数字自动判断秒/毫秒；<=0 视为无重置时间。 */
+function volcExtractReset(v: unknown): string | null {
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' && Number.isFinite(v)) return millisToIso(v);
+  return null;
+}
+
+/** 判断 OpenAPI 错误码是否属于鉴权类（需硬停并提示换 AK/SK）。 */
+export function volcIsAuthErrorCode(code: string): boolean {
+  const c = code.toLowerCase();
+  return ['auth', 'signature', 'accessdenied', 'denied', 'unauthorized', 'forbidden', 'credential', 'token']
+    .some(k => c.includes(k));
+}
+
+/** 提取火山 OpenAPI 响应里的 ResponseMetadata.Error（或顶层 Error）。 */
+export function volcResponseError(body: any): { code: string; message: string } | null {
+  const err = body?.ResponseMetadata?.Error ?? body?.Error;
+  if (!err) return null;
+  const code = String(err.Code ?? '');
+  const message = String(err.Message ?? '');
+  if (!code && !message) return null;
+  return { code, message };
+}
+
+/** 构造按 key 字母序排序、逐段 URL 编码的 canonical query string。签名与实际 URL 共用。 */
+export function volcCanonicalQuery(action: string, region: string): string {
+  const pairs: Array<[string, string]> = [
+    ['Action', action], ['Region', region], ['Version', VOLC_API_VERSION],
+  ];
+  pairs.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return pairs.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&');
+}
+
+/**
+ * 生成火山引擎签名 V4 头，返回 (authorization, xDate, xContentSha256)。三者都要塞进请求头。
+ * 与标准 SigV4 的两处致命差异：固定 header 顺序（不排序）、algorithm 无 AWS4 前缀且
+ * scope 结尾 `request`、签名密钥 kDate=HMAC(SK, date)（SK 不加 AWS4 前缀）。`now` 作参数便于确定性单测。
+ */
+export function volcSign(
+  accessKeyId: string, secretAccessKey: string, region: string,
+  canonicalQuery: string, body: Buffer, now: Date,
+): { authorization: string; xDate: string; xContentSha256: string } {
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+  const y = now.getUTCFullYear(), mo = pad(now.getUTCMonth() + 1), d = pad(now.getUTCDate());
+  const h = pad(now.getUTCHours()), mi = pad(now.getUTCMinutes()), s = pad(now.getUTCSeconds());
+  const xDate = `${y}${mo}${d}T${h}${mi}${s}Z`;
+  const shortDate = `${y}${mo}${d}`;
+  const sha256hex = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');
+  const hmac = (key: Buffer | string, data: string) => createHmac('sha256', key).update(data).digest();
+  const xContentSha256 = sha256hex(body);
+
+  // 固定顺序 canonical headers（火山特有，不排序）。
+  const canonicalHeaders =
+    `host:${VOLC_OPENAPI_HOST}\nx-date:${xDate}\nx-content-sha256:${xContentSha256}\ncontent-type:${VOLC_CONTENT_TYPE}\n`;
+  const canonicalRequest =
+    `POST\n/\n${canonicalQuery}\n${canonicalHeaders}\n${VOLC_SIGNED_HEADERS}\n${xContentSha256}`;
+
+  const credentialScope = `${shortDate}/${region}/${VOLC_SERVICE}/request`;
+  const stringToSign = `HMAC-SHA256\n${xDate}\n${credentialScope}\n${sha256hex(canonicalRequest)}`;
+
+  const kDate = hmac(secretAccessKey, shortDate);
+  const kRegion = hmac(kDate, region);
+  const kService = hmac(kRegion, VOLC_SERVICE);
+  const kSigning = hmac(kService, 'request');
+  const signature = createHmac('sha256', kSigning).update(stringToSign).digest('hex');
+
+  const authorization =
+    `HMAC-SHA256 Credential=${accessKeyId}/${credentialScope}, SignedHeaders=${VOLC_SIGNED_HEADERS}, Signature=${signature}`;
+  return { authorization, xDate, xContentSha256 };
+}
+
+type VolcCall =
+  | { kind: 'body'; body: any }
+  | { kind: 'auth'; detail: string }
+  | { kind: 'soft'; detail: string };
+
+async function volcCall(
+  region: string, accessKeyId: string, secretAccessKey: string, action: string, fetchImpl: typeof fetch,
+): Promise<VolcCall> {
+  const canonicalQuery = volcCanonicalQuery(action, region);
+  const url = `https://${VOLC_OPENAPI_HOST}/?${canonicalQuery}`;
+  const body = Buffer.alloc(0);
+  const { authorization, xDate, xContentSha256 } = volcSign(accessKeyId, secretAccessKey, region, canonicalQuery, body, new Date());
+
+  let resp: Response;
+  try {
+    resp = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        'X-Date': xDate,
+        'X-Content-Sha256': xContentSha256,
+        'Content-Type': VOLC_CONTENT_TYPE,
+        'Authorization': authorization,
+      },
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (e) {
+    return { kind: 'soft', detail: `Network error: ${String((e as Error)?.message ?? e)}` };
+  }
+
+  if (resp.status === 401 || resp.status === 403) {
+    return { kind: 'auth', detail: `Authentication failed (HTTP ${resp.status}). ${VOLC_AKSK_HINT}` };
+  }
+  if (!resp.ok) {
+    // 火山网关对签名/凭据类错误常返 4xx（多为 400）并携带与 200 相同的 Error 信封，
+    // 而非 401/403。解析信封让 Bearer 被拒时也能给出 AK/SK 引导。
+    const raw = await resp.text().catch(() => '');
+    try {
+      const parsed = JSON.parse(raw);
+      const err = volcResponseError(parsed);
+      if (err) {
+        if (volcIsAuthErrorCode(err.code)) return { kind: 'auth', detail: `Authentication failed (HTTP ${resp.status}, ${err.code}): ${err.message}. ${VOLC_AKSK_HINT}` };
+        return { kind: 'soft', detail: `API error (HTTP ${resp.status}, ${err.code}): ${err.message}` };
+      }
+    } catch { /* not JSON */ }
+    return { kind: 'soft', detail: `API error (HTTP ${resp.status}): ${raw}` };
+  }
+
+  let parsed: any;
+  try { parsed = await resp.json(); }
+  catch (e) { return { kind: 'soft', detail: `Failed to parse response: ${String((e as Error)?.message ?? e)}` }; }
+
+  // 火山业务错误常以 200 + ResponseMetadata.Error 返回。
+  const err = volcResponseError(parsed);
+  if (err) {
+    if (volcIsAuthErrorCode(err.code)) return { kind: 'auth', detail: `Authentication failed (${err.code}): ${err.message}. ${VOLC_AKSK_HINT}` };
+    return { kind: 'soft', detail: `API error (${err.code}): ${err.message}` };
+  }
+  return { kind: 'body', body: parsed };
+}
+
+/**
+ * 解析 GetAFPUsage 的 Result 为 tier 列表。展示 5h/周/月三个窗口（与控制台一致）；
+ * AFPDaily 被官方控制台隐藏，跳过。Quota<=0 视为该窗口未订阅，跳过——也用于把
+ * “已鉴权但无 Agent Plan”识别为空结果，回落 Coding Plan。
+ */
+export function parseAfpTiers(result: any): { fiveHour?: QuotaTierInfo; weekly?: QuotaTierInfo; monthly?: QuotaTierInfo } {
+  const out: { fiveHour?: QuotaTierInfo; weekly?: QuotaTierInfo; monthly?: QuotaTierInfo } = {};
+  const map: Array<['fiveHour' | 'weekly' | 'monthly', string]> = [
+    ['fiveHour', 'AFPFiveHour'], ['weekly', 'AFPWeekly'], ['monthly', 'AFPMonthly'],
+  ];
+  for (const [slot, key] of map) {
+    const win = result?.[key];
+    if (!win) continue;
+    const quota = asF64(win.Quota) ?? 0;
+    if (quota <= 0) continue;
+    const used = asF64(win.Used) ?? 0;
+    out[slot] = { usedPct: used / quota * 100, resetsAt: volcExtractReset(win.ResetTime) };
+  }
+  return out;
+}
+
+/** 把 GetCodingPlanUsage 的 window 标签归一到 tier 槽位。 */
+function volcCodingWindow(label: string): 'fiveHour' | 'weekly' | 'monthly' | null {
+  switch (label.toLowerCase()) {
+    case 'session': case '5h': case 'fivehour': case 'five_hour': case 'rolling_5h': return 'fiveHour';
+    case 'weekly': case 'week': case '7d': return 'weekly';
+    case 'monthly': case 'month': return 'monthly';
+    default: return null;
+  }
+}
+
+/**
+ * 解析 GetCodingPlanUsage 的 Result 为 tier 列表（防御式）。该接口回 session/weekly/
+ * monthly 窗口、只给百分比，重置时间是秒级。真实字段 `Level`（session/weekly/monthly），
+ * 其余作 fallback。宽松匹配 QuotaUsage/Usages/Details 数组。
+ */
+export function parseCodingPlanTiers(result: any): { fiveHour?: QuotaTierInfo; weekly?: QuotaTierInfo; monthly?: QuotaTierInfo } {
+  const out: { fiveHour?: QuotaTierInfo; weekly?: QuotaTierInfo; monthly?: QuotaTierInfo } = {};
+  const arr: any[] = Array.isArray(result?.QuotaUsage) ? result.QuotaUsage
+    : Array.isArray(result?.Usages) ? result.Usages
+    : Array.isArray(result?.Details) ? result.Details
+    : [];
+  for (const item of arr) {
+    const label = String(item?.Level ?? item?.Type ?? item?.Period ?? item?.Label ?? item?.Window ?? '');
+    const slot = volcCodingWindow(label);
+    if (!slot || out[slot]) continue;
+    const usedPct = asF64(item.Percent) ?? asF64(item.UsedPercent) ?? asF64(item.UsagePercent) ?? 0;
+    const resetsAt = volcExtractReset(item.ResetTime ?? item.ResetTimestamp);
+    out[slot] = { usedPct, resetsAt };
+  }
+  return out;
+}
+
+async function queryVolcengine(ref: QuotaCredentialRef, fetchImpl: typeof fetch): Promise<CredentialQuota> {
+  const ak = (ref.accessKeyId ?? '').trim();
+  const sk = (ref.secretAccessKey ?? '').trim();
+  if (!ak || !sk) {
+    return { status: 'not_configured', error: 'Volcengine usage query needs the account AccessKey ID + Secret (not the inference API key)', queriedAt: Date.now() };
+  }
+  const region = volcRegion(ref.baseURL);
+  const softErrors: string[] = [];
+
+  // 1) Agent Plan：GetAFPUsage
+  const afp = await volcCall(region, ak, sk, 'GetAFPUsage', fetchImpl);
+  if (afp.kind === 'auth') return { status: 'expired', error: afp.detail, queriedAt: Date.now() };
+  if (afp.kind === 'soft') softErrors.push(`GetAFPUsage: ${afp.detail}`);
+  else {
+    const result = afp.body?.Result ?? afp.body;
+    const tiers = parseAfpTiers(result);
+    if (tiers.fiveHour || tiers.weekly || tiers.monthly) return { ...tiers, status: 'ok', queriedAt: Date.now() };
+  }
+
+  // 2) Coding Plan：GetCodingPlanUsage
+  const cp = await volcCall(region, ak, sk, 'GetCodingPlanUsage', fetchImpl);
+  if (cp.kind === 'auth') return { status: 'expired', error: cp.detail, queriedAt: Date.now() };
+  if (cp.kind === 'soft') softErrors.push(`GetCodingPlanUsage: ${cp.detail}`);
+  else {
+    const result = cp.body?.Result ?? cp.body;
+    const tiers = parseCodingPlanTiers(result);
+    if (tiers.fiveHour || tiers.weekly || tiers.monthly) return { ...tiers, status: 'ok', queriedAt: Date.now() };
+  }
+
+  if (softErrors.length > 0) return { status: 'error', error: softErrors.join('; '), queriedAt: Date.now() };
+  return { status: 'error', error: 'No active Agent Plan or Coding Plan subscription found for this credential', queriedAt: Date.now() };
 }
 
 /** True if at least one quota limit is configured — i.e. estimated mode can
@@ -205,7 +506,10 @@ export class QuotaFetcher {
         const provider = detectQuotaProvider(ref.baseURL);
         if (!provider) { this.snapshot.set(key, { status: 'not_configured', queriedAt: this.now() }); return; }
         try {
-          let result = provider === 'glm' ? await queryGlm(ref, this.fetchImpl) : await queryMinimax(ref, this.fetchImpl);
+          let result = provider === 'glm' ? await queryGlm(ref, this.fetchImpl)
+            : provider === 'minimax' ? await queryMinimax(ref, this.fetchImpl)
+            : provider === 'deepseek' ? await queryDeepseek(ref, this.fetchImpl)
+            : await queryVolcengine(ref, this.fetchImpl);
           // GLM team-plan accounts expose no official quota query interface
           // (queryGlm returns not_configured with "当前用户不存在coding plan").
           // Fall back to estimated mode from TokenUsageTracker + quotaLimits so
@@ -218,6 +522,8 @@ export class QuotaFetcher {
             if (prior) {
               if (prior.fiveHour && !result.fiveHour) result.fiveHour = prior.fiveHour;
               if (prior.weekly && !result.weekly) result.weekly = prior.weekly;
+              if (prior.monthly && !result.monthly) result.monthly = prior.monthly;
+              if (prior.balance && !result.balance) result.balance = prior.balance;
             }
           }
           this.snapshot.set(key, result);
@@ -228,6 +534,8 @@ export class QuotaFetcher {
           if (prior) {
             if (prior.fiveHour && !result.fiveHour) result.fiveHour = prior.fiveHour;
             if (prior.weekly && !result.weekly) result.weekly = prior.weekly;
+            if (prior.monthly && !result.monthly) result.monthly = prior.monthly;
+            if (prior.balance && !result.balance) result.balance = prior.balance;
           }
           this.snapshot.set(key, result);
         }

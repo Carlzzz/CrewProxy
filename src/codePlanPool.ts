@@ -240,7 +240,7 @@ export class CodePlanPoolManager {
       // the other key. Only real fetched quota should drive proactive cooldowns;
       // estimated-mode keys rely on the reactive 429 path instead.
       if (q.estimated) continue;
-      const tiers = [q.fiveHour, q.weekly].filter((t): t is NonNullable<typeof t> => !!t);
+      const tiers = [q.fiveHour, q.weekly, q.monthly].filter((t): t is NonNullable<typeof t> => !!t);
       if (tiers.length === 0) continue;
 
       const worst = Math.max(...tiers.map(t => t.usedPct));

@@ -5,9 +5,11 @@ export type RedactedCredential = Omit<CodePlanCredential, 'apiKey'> & {
   apiKeyMasked: string;
 };
 
-export type RedactedUpstream = Omit<UpstreamConfig, 'apiKey' | 'codePlanCredentials'> & {
+export type RedactedUpstream = Omit<UpstreamConfig, 'apiKey' | 'codePlanCredentials' | 'secretAccessKey'> & {
   hasApiKey: boolean;
   apiKeyMasked: string;
+  hasSecretAccessKey?: boolean;
+  secretAccessKeyMasked?: string;
   codePlanCredentials?: RedactedCredential[];
 };
 
@@ -33,12 +35,17 @@ function redactCredential(c: CodePlanCredential): RedactedCredential {
 }
 
 function redactUpstream(u: UpstreamConfig): RedactedUpstream {
-  const { apiKey, codePlanCredentials, ...rest } = u;
+  const { apiKey, codePlanCredentials, secretAccessKey, ...rest } = u;
   const out: RedactedUpstream = {
     ...rest,
     hasApiKey: Boolean(apiKey),
     apiKeyMasked: maskSecret(apiKey),
   };
+  // Volcengine SecretAccessKey is a secret; accessKeyId (kept in ...rest) is an identifier.
+  if (secretAccessKey !== undefined) {
+    out.hasSecretAccessKey = Boolean(secretAccessKey);
+    out.secretAccessKeyMasked = maskSecret(secretAccessKey);
+  }
   if (codePlanCredentials) out.codePlanCredentials = codePlanCredentials.map(redactCredential);
   return out;
 }

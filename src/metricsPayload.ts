@@ -24,7 +24,38 @@ function providerLabel(upstreamId: string, u: UpstreamConfig): string {
   const url = (u.baseURL || '').toLowerCase();
   if (url.includes('bigmodel.cn') || url.includes('z.ai')) return 'glm';
   if (url.includes('minimaxi.com') || url.includes('minimax.io')) return 'minimax';
+  if (url.includes('volces.com')) return 'volcengine';
+  if (url.includes('api.deepseek.com')) return 'deepseek';
   return upstreamId;
+}
+
+/** True if the upstream is Volcengine with account-level AK/SK quota (no key pool). */
+function isVolcengineAccountUpstream(u: UpstreamConfig): boolean {
+  return !!(u.accessKeyId && u.secretAccessKey && !u.codePlanCredentials?.length);
+}
+
+/** True if the upstream is a DeepSeek pay-as-you-go account (balance, no key pool). */
+function isDeepseekAccountUpstream(u: UpstreamConfig): boolean {
+  return !!(u.apiKey && (u.baseURL || '').toLowerCase().includes('api.deepseek.com') && !u.codePlanCredentials?.length);
+}
+
+/** Assemble the dashboard quota object from a snapshot entry (5h / weekly / monthly / balance). */
+function buildQuotaObject(q: CredentialQuota | undefined, limits: { fiveHourTokens?: number; weeklyTokens?: number } | undefined): any {
+  if (!q || q.status !== 'ok') return null;
+  const quota: any = { estimated: q.estimated ?? false };
+  const tier = (t: NonNullable<CredentialQuota['fiveHour']>, limit: number | null) => ({
+    usedPct: t.usedPct,
+    usedTokens: limit !== null ? Math.round(t.usedPct / 100 * limit) : null,
+    limitTokens: limit,
+    resetsAt: t.resetsAt,
+  });
+  if (q.fiveHour) quota.fiveHour = tier(q.fiveHour, limits?.fiveHourTokens ?? null);
+  if (q.weekly) quota.weekly = tier(q.weekly, limits?.weeklyTokens ?? null);
+  // Monthly has no configured token limit (Volcengine reports percent only).
+  if (q.monthly) quota.monthly = tier(q.monthly, null);
+  // Balance is a monetary amount (DeepSeek pay-as-you-go), not a percentage tier.
+  if (q.balance) quota.balance = { remaining: q.balance.remaining, total: q.balance.total ?? null, currency: q.balance.currency, isValid: q.balance.isValid };
+  return quota;
 }
 
 export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
@@ -67,32 +98,9 @@ export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
     if (health === 'down') downCount++; else activeCount++;
 
     // Credentials
-    const credentials = (upstream.codePlanCredentials ?? []).filter(c => c.enabled).map(c => {
+    let credentials = (upstream.codePlanCredentials ?? []).filter(c => c.enabled).map(c => {
       const heat = poolStatus.find(h => h.credentialId === c.id);
       const q = quotaSnap.get(`${upstreamId}\0${c.id}`);
-      let quota: any = null;
-      if (q && q.status === 'ok') {
-        quota = {};
-        quota.estimated = q.estimated ?? false;
-        if (q.fiveHour) {
-          const limit = upstream.quotaLimits?.fiveHourTokens ?? null;
-          quota.fiveHour = {
-            usedPct: q.fiveHour.usedPct,
-            usedTokens: limit !== null ? Math.round(q.fiveHour.usedPct / 100 * limit) : null,
-            limitTokens: limit,
-            resetsAt: q.fiveHour.resetsAt,
-          };
-        }
-        if (q.weekly) {
-          const limit = upstream.quotaLimits?.weeklyTokens ?? null;
-          quota.weekly = {
-            usedPct: q.weekly.usedPct,
-            usedTokens: limit !== null ? Math.round(q.weekly.usedPct / 100 * limit) : null,
-            limitTokens: limit,
-            resetsAt: q.weekly.resetsAt,
-          };
-        }
-      }
       return {
         id: c.id,
         inCooldown: heat?.inCooldown ?? false,
@@ -100,11 +108,29 @@ export function buildMetricsPayload(ctx: ProxyRuntimeContext): unknown {
         cooldownReason: heat?.cooldownReason ?? null,
         inFlight: ctx.codePlanPool?.getInFlight(upstreamId, c.id) ?? 0,
         requestsLast1h: heat?.requestsLast1h ?? 0,
-        quota,
+        quota: buildQuotaObject(q, upstream.quotaLimits),
         quotaStatus: q?.status ?? 'not_configured',
         quotaError: q?.error ?? null,
       };
     });
+
+    // Account-level upstreams (Volcengine AK/SK quota, DeepSeek pay-as-you-go
+    // balance) have no key pool; surface a single synthetic 'account' credential
+    // so the dashboard can render their quota bars / balance.
+    if (credentials.length === 0 && (isVolcengineAccountUpstream(upstream) || isDeepseekAccountUpstream(upstream))) {
+      const q = quotaSnap.get(`${upstreamId}\0account`);
+      credentials = [{
+        id: 'account',
+        inCooldown: false,
+        cooldownUntil: null,
+        cooldownReason: null,
+        inFlight: 0,
+        requestsLast1h: 0,
+        quota: buildQuotaObject(q, upstream.quotaLimits),
+        quotaStatus: q?.status ?? 'not_configured',
+        quotaError: q?.error ?? null,
+      }];
+    }
 
     providers.push({
       upstreamId,

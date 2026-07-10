@@ -11,7 +11,9 @@
       "baseURL": "https://ark.cn-beijing.volces.com/api/coding",
       "apiKey": "f5c4d134-0025-44c6-871f-3835e292aaa1",
       "model": "doubao-seed-2.0-pro",
-      "provider": "ark"
+      "provider": "ark",
+      "accessKeyId": "AKLTZTAyN2E3MWFhMDliNGMxOWIwZTBhY2QzODNjZGQxYTA",
+      "secretAccessKey": "WXpkak5UQm1NRFl5TW1Vek5HWXpaR0ZoTnpnME1qTmlNRGt3TUdKbE1qQQ=="
     },
     "glm": {
       "baseURL": "https://open.bigmodel.cn/api/anthropic",

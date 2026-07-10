@@ -87,6 +87,17 @@ function mergeUpstreamRaw(
   base.apiKey = key;
   if (d.model !== undefined) base.model = String(d.model);
   if (d.provider !== undefined) base.provider = String(d.provider);
+  if (d.accessKeyId !== undefined) base.accessKeyId = String(d.accessKeyId);
+  // secretAccessKey follows the same keep/replace secret semantics as apiKey:
+  // a masked draft (secretAccessKeyMode: 'keep' or no usable value) preserves
+  // the on-disk secret; an explicit string replaces it.
+  if ('secretAccessKey' in d || 'secretAccessKeyMode' in d) {
+    const cur = asString((curUp as Record<string, unknown> | undefined)?.secretAccessKey);
+    const draftSk = { apiKeyMode: (d as Record<string, unknown>).secretAccessKeyMode, apiKey: (d as Record<string, unknown>).secretAccessKey };
+    const { key: sk } = resolveSecretField(cur, draftSk);
+    if (sk) base.secretAccessKey = sk;
+    else delete base.secretAccessKey;
+  }
   if (d.quotaLimits !== undefined && isObject(d.quotaLimits)) {
     base.quotaLimits = cloneJson(d.quotaLimits);
   }
@@ -161,6 +172,14 @@ function redactUpstreamRaw(u: Record<string, unknown>): Record<string, unknown> 
   delete out.apiKey;
   out.hasApiKey = Boolean(apiKey);
   out.apiKeyMasked = maskSecret(asString(apiKey));
+  // Volcengine SecretAccessKey is a secret (like apiKey) and must never leave
+  // the gateway in cleartext. accessKeyId is an identifier and stays plaintext.
+  if ('secretAccessKey' in out) {
+    const sk = out.secretAccessKey;
+    delete out.secretAccessKey;
+    out.hasSecretAccessKey = Boolean(sk);
+    out.secretAccessKeyMasked = maskSecret(asString(sk));
+  }
   if (Array.isArray(out.codePlanCredentials)) {
     out.codePlanCredentials = out.codePlanCredentials.map((c) =>
       isObject(c) ? redactCredentialRaw(c) : c,

@@ -19,6 +19,8 @@ export interface UpstreamConfig {
         weeklyTokens?: number;
     };
     quotaMode?: 'fetch' | 'estimated';
+    accessKeyId?: string;
+    secretAccessKey?: string;
 }
 export interface ModelRouteTarget {
     upstream: string;

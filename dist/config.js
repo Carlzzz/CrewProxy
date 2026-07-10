@@ -70,6 +70,12 @@ function normalizeUpstream(u) {
     if (o.quotaMode === 'fetch' || o.quotaMode === 'estimated') {
         out.quotaMode = o.quotaMode;
     }
+    if (typeof o.accessKeyId === 'string' && o.accessKeyId) {
+        out.accessKeyId = o.accessKeyId;
+    }
+    if (typeof o.secretAccessKey === 'string' && o.secretAccessKey) {
+        out.secretAccessKey = o.secretAccessKey;
+    }
     return out;
 }
 function readConfigFile(filePath) {

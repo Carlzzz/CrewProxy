@@ -4,7 +4,7 @@ import { loadConfig, parseProxyConfigObject, buildUpstreamsByIdMap, ProxyConfig,
 import { createProxyServer } from './proxy';
 import { CodePlanPoolManager } from './codePlanPool';
 import { MetricsCollector } from './metricsCollector';
-import { QuotaFetcher } from './quotaFetcher';
+import { QuotaFetcher, detectQuotaProvider } from './quotaFetcher';
 import type { QuotaUpstreamRef } from './quotaFetcher';
 import { TokenUsageTracker } from './tokenUsageTracker';
 import { JsonStateStore } from './stateStore';
@@ -44,7 +44,36 @@ ctx.tokenUsage = tokenUsage;
 function buildQuotaUpstreams(cfg: ProxyConfig): QuotaUpstreamRef[] {
   const out: QuotaUpstreamRef[] = [];
   const collect = (upstreamId: string, u: UpstreamConfig | undefined) => {
-    if (!u || !u.codePlanCredentials) return;
+    if (!u) return;
+    // Volcengine (火山方舟) quota is account-level (one AK/SK), queried via
+    // control-plane OpenAPI rather than a per-key data-plane balance endpoint.
+    // Such upstreams have no codePlanCredentials pool, so synthesize a single
+    // 'account' credential carrying the AK/SK when they're configured.
+    if (u.accessKeyId && u.secretAccessKey && !u.codePlanCredentials?.length) {
+      out.push({
+        upstreamId,
+        quotaMode: 'fetch',
+        quotaLimits: u.quotaLimits,
+        credentials: [{ upstreamId, credentialId: 'account', apiKey: u.apiKey, baseURL: u.baseURL, accessKeyId: u.accessKeyId, secretAccessKey: u.secretAccessKey }],
+      });
+      return;
+    }
+    if (!u.codePlanCredentials?.length) {
+      // Account-level balance providers (e.g. DeepSeek pay-as-you-go) have no
+      // credential pool — just a single upstream apiKey. Synthesize an 'account'
+      // credential so their balance still shows on the dashboard. Gated to
+      // balance providers so quota-type upstreams (GLM/MiniMax) configured only
+      // via a bare default apiKey aren't silently pulled into official-API polling.
+      if (u.apiKey && detectQuotaProvider(u.baseURL) === 'deepseek') {
+        out.push({
+          upstreamId,
+          quotaMode: 'fetch',
+          quotaLimits: u.quotaLimits,
+          credentials: [{ upstreamId, credentialId: 'account', apiKey: u.apiKey, baseURL: u.baseURL }],
+        });
+      }
+      return;
+    }
     const credentials = u.codePlanCredentials
       .filter(c => c.enabled && c.apiKey)
       .map(c => ({ upstreamId, credentialId: c.id, apiKey: c.apiKey, baseURL: u.baseURL }));

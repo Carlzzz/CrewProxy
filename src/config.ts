@@ -21,6 +21,11 @@ export interface UpstreamConfig {
   ordinaryFallbackModelMap?: Record<string, string>;
   quotaLimits?: { fiveHourTokens?: number; weeklyTokens?: number };
   quotaMode?: 'fetch' | 'estimated';
+  // Volcengine (火山方舟) usage query uses control-plane OpenAPI with SigV4
+  // signing, which needs the account AccessKey ID + Secret — a separate pair
+  // from the data-plane inference apiKey. Only meaningful for volces.com upstreams.
+  accessKeyId?: string;
+  secretAccessKey?: string;
 }
 
 export interface ModelRouteTarget {
@@ -114,6 +119,12 @@ export function normalizeUpstream(u: unknown): UpstreamConfig {
   }
   if (o.quotaMode === 'fetch' || o.quotaMode === 'estimated') {
     out.quotaMode = o.quotaMode;
+  }
+  if (typeof o.accessKeyId === 'string' && o.accessKeyId) {
+    out.accessKeyId = o.accessKeyId;
+  }
+  if (typeof o.secretAccessKey === 'string' && o.secretAccessKey) {
+    out.secretAccessKey = o.secretAccessKey;
   }
   return out;
 }

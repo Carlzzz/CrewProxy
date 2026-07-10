@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectQuotaProvider, parseGlmTiers, parseMinimaxTiers, QuotaFetcher } from '../src/quotaFetcher';
+import { detectQuotaProvider, parseGlmTiers, parseMinimaxTiers, QuotaFetcher,
+  parseAfpTiers, parseCodingPlanTiers, volcRegion, volcCanonicalQuery, volcSign,
+  volcIsAuthErrorCode, volcResponseError, parseDeepseekBalance } from '../src/quotaFetcher';
 import { TokenUsageTracker } from '../src/tokenUsageTracker';
 
 // ── detectQuotaProvider ──
@@ -281,4 +283,226 @@ test('MiniMax fetch: error 不受 GLM 回退逻辑影响', async () => {
   await qf.refreshOnce();
   const entry = qf.getSnapshot().get('minimax\0mm1')!;
   assert.equal(entry.status, 'error', 'MiniMax 错误不应触发 GLM 专属回退');
+});
+
+// ── 火山方舟 Agent Plan / Coding Plan（移植自 cc-switch coding_plan.rs 单测）──
+
+test('detect Volcengine by volces.com/api/coding (not /api/v3)', () => {
+  assert.equal(detectQuotaProvider('https://ark.cn-beijing.volces.com/api/coding'), 'volcengine');
+  assert.equal(detectQuotaProvider('https://ark.cn-beijing.volces.com/api/coding/v3'), 'volcengine');
+  // 数据面按量付费入口无套餐额度，不命中
+  assert.equal(detectQuotaProvider('https://ark.cn-beijing.volces.com/api/v3'), null);
+});
+
+test('volcRegion derivation', () => {
+  assert.equal(volcRegion('https://ark.cn-beijing.volces.com/api/coding'), 'cn-beijing');
+  assert.equal(volcRegion('https://ark.cn-shanghai.volces.com/api/coding/v3'), 'cn-shanghai');
+  assert.equal(volcRegion('https://example.com/api/coding'), 'cn-beijing');
+});
+
+test('parseAfpTiers: three windows, daily skipped, Quota<=0 skipped', () => {
+  const result = {
+    PlanType: 'Large',
+    AFPFiveHour: { Quota: 50.0, Used: 12.5, ResetTime: 1778806800000 },
+    AFPDaily: { Quota: 100.0, Used: 22.5, ResetTime: 1778803200000 },
+    AFPWeekly: { Quota: 500.0, Used: 150.0, ResetTime: 1779062400000 },
+    AFPMonthly: { Quota: 2000.0, Used: 850.5, ResetTime: 1780531200000 },
+  };
+  const t = parseAfpTiers(result);
+  assert.ok(Math.abs(t.fiveHour!.usedPct - 25.0) < 1e-9);
+  assert.ok(Math.abs(t.weekly!.usedPct - 30.0) < 1e-9);
+  assert.ok(Math.abs(t.monthly!.usedPct - 42.525) < 1e-9);
+  assert.ok(t.monthly!.resetsAt);
+});
+
+test('parseAfpTiers: all Quota=0 → empty (triggers Coding Plan fallback)', () => {
+  const t = parseAfpTiers({ AFPFiveHour: { Quota: 0, Used: 0 }, AFPWeekly: { Quota: 0, Used: 0 } });
+  assert.deepEqual(t, {});
+});
+
+test('parseCodingPlanTiers: real Level response, session -1 reset → null', () => {
+  const result = { QuotaUsage: [
+    { Level: 'session', Percent: 0.0, ResetTimestamp: -1 },
+    { Level: 'weekly', Percent: 1.672568, ResetTimestamp: 1782057600 },
+    { Level: 'monthly', Percent: 0.836284, ResetTimestamp: 1784303999 },
+  ]};
+  const t = parseCodingPlanTiers(result);
+  assert.equal(t.fiveHour!.usedPct, 0.0);
+  assert.equal(t.fiveHour!.resetsAt, null);
+  assert.ok(Math.abs(t.weekly!.usedPct - 1.672568) < 1e-6);
+  assert.ok(t.weekly!.resetsAt);
+  assert.ok(Math.abs(t.monthly!.usedPct - 0.836284) < 1e-6);
+});
+
+test('volcCanonicalQuery is sorted and encoded', () => {
+  assert.equal(volcCanonicalQuery('GetAFPUsage', 'cn-beijing'),
+    'Action=GetAFPUsage&Region=cn-beijing&Version=2024-01-01');
+});
+
+test('volcSign structure + determinism (empty body sha, scope, header order)', () => {
+  const now = new Date('2024-06-21T00:00:00Z');
+  const query = volcCanonicalQuery('GetAFPUsage', 'cn-beijing');
+  const { authorization, xDate, xContentSha256 } = volcSign('AKLTtest', 'secretkey', 'cn-beijing', query, Buffer.alloc(0), now);
+  // 空 body 的 SHA-256 固定值
+  assert.equal(xContentSha256, 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855');
+  assert.equal(xDate, '20240621T000000Z');
+  assert.ok(authorization.startsWith('HMAC-SHA256 Credential=AKLTtest/20240621/cn-beijing/ark/request,'), authorization);
+  assert.ok(authorization.includes('SignedHeaders=host;x-date;x-content-sha256;content-type,'), authorization);
+  const sig = authorization.split('Signature=').pop()!;
+  assert.equal(sig.length, 64);
+  assert.ok(/^[0-9a-f]+$/.test(sig));
+  // 确定性
+  const again = volcSign('AKLTtest', 'secretkey', 'cn-beijing', query, Buffer.alloc(0), now);
+  assert.equal(authorization, again.authorization);
+});
+
+test('volcIsAuthErrorCode + volcResponseError extraction', () => {
+  assert.ok(volcIsAuthErrorCode('AccessDenied'));
+  assert.ok(volcIsAuthErrorCode('SignatureDoesNotMatch'));
+  assert.ok(!volcIsAuthErrorCode('InvalidParameter.Action'));
+  const err = volcResponseError({ ResponseMetadata: { Error: { Code: 'AccessDenied', Message: 'no permission' } } });
+  assert.deepEqual(err, { code: 'AccessDenied', message: 'no permission' });
+  assert.equal(volcResponseError({ ResponseMetadata: { RequestId: 'x' }, Result: {} }), null);
+});
+
+test('QuotaFetcher: Volcengine account credential, AFP success', async () => {
+  const fakeFetch = (async (url: string) => {
+    const u = String(url);
+    if (u.includes('open.volcengineapi.com') && u.includes('GetAFPUsage')) {
+      return new Response(JSON.stringify({ Result: {
+        PlanType: 'Large',
+        AFPFiveHour: { Quota: 100, Used: 20, ResetTime: 1778806800000 },
+        AFPWeekly: { Quota: 500, Used: 150 },
+        AFPMonthly: { Quota: 2000, Used: 400 },
+      }}), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('not found', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1_700_000_000_000 });
+  qf.reload([{ upstreamId: 'ark', quotaMode: 'fetch', credentials: [{ upstreamId: 'ark', credentialId: 'account', apiKey: 'BEARER', baseURL: 'https://ark.cn-beijing.volces.com/api/coding', accessKeyId: 'AKLTx', secretAccessKey: 'sk' }] }]);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('ark\0account')!;
+  assert.equal(entry.status, 'ok');
+  assert.equal(entry.fiveHour!.usedPct, 20);
+  assert.equal(entry.weekly!.usedPct, 30);
+  assert.equal(entry.monthly!.usedPct, 20);
+});
+
+test('QuotaFetcher: Volcengine falls back to Coding Plan when AFP empty', async () => {
+  const fakeFetch = (async (url: string) => {
+    const u = String(url);
+    if (u.includes('GetAFPUsage')) {
+      return new Response(JSON.stringify({ Result: { AFPFiveHour: { Quota: 0, Used: 0 } } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (u.includes('GetCodingPlanUsage')) {
+      return new Response(JSON.stringify({ Result: { QuotaUsage: [
+        { Level: 'session', Percent: 5.0, ResetTimestamp: -1 },
+        { Level: 'weekly', Percent: 12.0, ResetTimestamp: 1782057600 },
+      ]}}), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('x', { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1 });
+  qf.reload([{ upstreamId: 'ark', quotaMode: 'fetch', credentials: [{ upstreamId: 'ark', credentialId: 'account', apiKey: '', baseURL: 'https://ark.cn-beijing.volces.com/api/coding', accessKeyId: 'AKLTx', secretAccessKey: 'sk' }] }]);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('ark\0account')!;
+  assert.equal(entry.status, 'ok');
+  assert.equal(entry.fiveHour!.usedPct, 5.0);
+  assert.equal(entry.weekly!.usedPct, 12.0);
+});
+
+test('QuotaFetcher: Volcengine auth error → expired', async () => {
+  const fakeFetch = (async () => new Response(JSON.stringify({
+    ResponseMetadata: { Error: { Code: 'InvalidAuthorization', Message: 'bad sig' } },
+  }), { status: 400, headers: { 'content-type': 'application/json' } })) as unknown as typeof fetch;
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1 });
+  qf.reload([{ upstreamId: 'ark', quotaMode: 'fetch', credentials: [{ upstreamId: 'ark', credentialId: 'account', apiKey: '', baseURL: 'https://ark.cn-beijing.volces.com/api/coding', accessKeyId: 'AKLTx', secretAccessKey: 'sk' }] }]);
+  await qf.refreshOnce();
+  assert.equal(qf.getSnapshot().get('ark\0account')!.status, 'expired');
+});
+
+test('QuotaFetcher: Volcengine missing AK/SK → not_configured', async () => {
+  const qf = new QuotaFetcher({ now: () => 1 });
+  qf.reload([{ upstreamId: 'ark', quotaMode: 'fetch', credentials: [{ upstreamId: 'ark', credentialId: 'account', apiKey: '', baseURL: 'https://ark.cn-beijing.volces.com/api/coding' }] }]);
+  await qf.refreshOnce();
+  assert.equal(qf.getSnapshot().get('ark\0account')!.status, 'not_configured');
+});
+
+// ── DeepSeek 账户余额（移植自 cc-switch services/balance.rs）──
+
+test('detect DeepSeek by api.deepseek.com', () => {
+  assert.equal(detectQuotaProvider('https://api.deepseek.com/anthropic'), 'deepseek');
+});
+
+test('parseDeepseekBalance: picks currency with balance, carries is_available', () => {
+  const b = parseDeepseekBalance({
+    is_available: true,
+    balance_infos: [
+      { currency: 'USD', total_balance: '0', granted_balance: '0', topped_up_balance: '0' },
+      { currency: 'CNY', total_balance: '42.68', granted_balance: '0', topped_up_balance: '42.68' },
+    ],
+  })!;
+  assert.equal(b.remaining, 42.68);
+  assert.equal(b.currency, 'CNY');
+  assert.equal(b.isValid, true);
+});
+
+test('parseDeepseekBalance: falls back to first info, propagates is_available=false', () => {
+  const b = parseDeepseekBalance({ is_available: false, balance_infos: [{ currency: 'CNY', total_balance: 0 }] })!;
+  assert.equal(b.remaining, 0);
+  assert.equal(b.currency, 'CNY');
+  assert.equal(b.isValid, false);
+});
+
+test('parseDeepseekBalance: empty balance_infos → undefined', () => {
+  assert.equal(parseDeepseekBalance({ is_available: true, balance_infos: [] }), undefined);
+  assert.equal(parseDeepseekBalance({}), undefined);
+});
+
+test('QuotaFetcher: DeepSeek balance success', async () => {
+  const fakeFetch = (async (url: string, init: any) => {
+    assert.ok(String(url).includes('api.deepseek.com/user/balance'));
+    assert.equal(init.headers['Authorization'], 'Bearer DS-KEY');
+    return new Response(JSON.stringify({
+      is_available: true,
+      balance_infos: [{ currency: 'CNY', total_balance: '88.5', granted_balance: '0', topped_up_balance: '88.5' }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1 });
+  qf.reload([{ upstreamId: 'deepseek', quotaMode: 'fetch', credentials: [{ upstreamId: 'deepseek', credentialId: 'account', apiKey: 'DS-KEY', baseURL: 'https://api.deepseek.com/anthropic' }] }]);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('deepseek\0account')!;
+  assert.equal(entry.status, 'ok');
+  assert.equal(entry.balance!.remaining, 88.5);
+  assert.equal(entry.balance!.currency, 'CNY');
+  assert.equal(entry.balance!.isValid, true);
+});
+
+test('QuotaFetcher: DeepSeek 401 → expired', async () => {
+  const fakeFetch = (async () => new Response('unauth', { status: 401 })) as unknown as typeof fetch;
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1 });
+  qf.reload([{ upstreamId: 'deepseek', quotaMode: 'fetch', credentials: [{ upstreamId: 'deepseek', credentialId: 'account', apiKey: 'K', baseURL: 'https://api.deepseek.com/anthropic' }] }]);
+  await qf.refreshOnce();
+  assert.equal(qf.getSnapshot().get('deepseek\0account')!.status, 'expired');
+});
+
+test('QuotaFetcher: DeepSeek retains prior balance on transient error', async () => {
+  let calls = 0;
+  const fakeFetch = (async () => {
+    calls++;
+    if (calls === 1) return new Response(JSON.stringify({ is_available: true, balance_infos: [{ currency: 'CNY', total_balance: '10' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response('boom', { status: 500 });
+  }) as unknown as typeof fetch;
+
+  const qf = new QuotaFetcher({ fetchImpl: fakeFetch, now: () => 1 });
+  qf.reload([{ upstreamId: 'deepseek', quotaMode: 'fetch', credentials: [{ upstreamId: 'deepseek', credentialId: 'account', apiKey: 'K', baseURL: 'https://api.deepseek.com/anthropic' }] }]);
+  await qf.refreshOnce();
+  assert.equal(qf.getSnapshot().get('deepseek\0account')!.balance!.remaining, 10);
+  await qf.refreshOnce();
+  const entry = qf.getSnapshot().get('deepseek\0account')!;
+  assert.equal(entry.status, 'error');
+  assert.equal(entry.balance!.remaining, 10, 'prior balance retained through transient error');
 });
