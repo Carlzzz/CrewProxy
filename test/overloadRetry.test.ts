@@ -205,3 +205,39 @@ test('529 with Retry-After header: proxy still retries to 200', async () => {
     }
   });
 });
+
+// ── Stream request, upstream stuck prefilling (never sends header) ──
+// This is the AmbiCrew hang: GLM under load accepts the connection but takes
+// >60s to emit the first byte. Previously the 60s fetch timeout fired, retried,
+// GLM re-prefilled, ... piling up to ~10min. Now: streaming uses a long
+// first-byte budget AND does NOT retry on fetch failure — it surfaces fast.
+test('stream request, upstream stuck on prefill: surfaces error fast, no 10min hang', async () => {
+  const savedFb = process.env.WOICLAW_STREAM_FIRST_BYTE_TIMEOUT_MS;
+  process.env.WOICLAW_STREAM_FIRST_BYTE_TIMEOUT_MS = '300'; // 300ms first-byte budget
+  try {
+    // Mock accepts the connection but never writes a response (simulates GLM
+    // stuck prefilling a large context under load).
+    const mock = await startMock(() => { /* intentionally never respond */ });
+    try {
+      await withProxy(mock.port, false, async (p) => {
+        const t0 = Date.now();
+        const r1 = await post(
+          p,
+          '/v1/messages',
+          { 'Content-Type': 'application/json', 'x-api-key': 'test' },
+          JSON.stringify({ model: 'glm-5.2', max_tokens: 16, stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+        );
+        const dt = Date.now() - t0;
+        assert.notEqual(r1.status, 200, 'must not succeed when upstream never responds');
+        // Fast failure proves we did NOT enter the multi-round backoff (which
+        // would take seconds-to-minutes). 300ms timeout → surface → done.
+        assert.ok(dt < 5000, `expected fast failure (no hang), took ${dt}ms`);
+      });
+    } finally {
+      mock.mockUpstream.close();
+    }
+  } finally {
+    if (savedFb === undefined) delete process.env.WOICLAW_STREAM_FIRST_BYTE_TIMEOUT_MS;
+    else process.env.WOICLAW_STREAM_FIRST_BYTE_TIMEOUT_MS = savedFb;
+  }
+});

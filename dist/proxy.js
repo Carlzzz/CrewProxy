@@ -114,6 +114,16 @@ function sendErrorResponse(res, statusCode, message, errorType) {
  *  byte" phase. GLM coding-plan upstreams occasionally stall there with no
  *  response at all, which previously hung the request indefinitely. */
 const UPSTREAM_TIMEOUT_MS = 60_000;
+/** First-byte (response-header) timeout for STREAMING requests. Streaming does
+ *  a long prefill before emitting the first byte; GLM under load with a large
+ *  agent context (system prompt + tools + history) routinely takes well over
+ *  60s. Cutting at 60s and retrying makes GLM re-prefill from scratch — so it
+ *  never completes and the 7-round backoff piles up to ~10min (the AmbiCrew
+ *  hang). Streaming therefore gets a much larger first-byte budget; the body
+ *  phase after the first byte is guarded by STREAM_READ_TIMEOUT_MS. */
+function streamFirstByteTimeoutMs() {
+    return readPositiveIntEnv('WOICLAW_STREAM_FIRST_BYTE_TIMEOUT_MS', 300_000);
+}
 async function fetchUpstream(url, init, timeoutMs = UPSTREAM_TIMEOUT_MS) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -838,6 +848,9 @@ async function handleRequest(req, res, ctx) {
     let effectiveApiKey = upstream.apiKey;
     let effectiveBaseURL = upstream.baseURL;
     const maxCredAttempts = hasCodePlan ? ((upstream.codePlanCredentials?.length ?? 0) + 1) : 1;
+    // Streaming requests do a long prefill before the first byte; give them a
+    // much larger first-byte budget than non-streaming (see STREAM_FIRST_BYTE_TIMEOUT_MS).
+    const fetchTimeoutMs = parsedBody.stream ? streamFirstByteTimeoutMs() : UPSTREAM_TIMEOUT_MS;
     let usedOrdinaryFallback = false;
     // **Fix #1**: Skip the "ordinary fallback" branch when it can't usefully run:
     //   (a) the upstream `apiKey` is empty — there's no real fallback configured;
@@ -930,7 +943,7 @@ async function handleRequest(req, res, ctx) {
                     method: 'POST',
                     headers: upstreamHeaders,
                     body: JSON.stringify(upstreamRequestBody),
-                });
+                }, fetchTimeoutMs);
                 if (upstreamResponse.status === 404 && targetURLs.indexOf(targetURL) < targetURLs.length - 1) {
                     logger_1.logger.verbose(`[${reqId}] 404 from ${targetURL}, trying next URL`);
                     upstreamResponse = null;
@@ -955,6 +968,15 @@ async function handleRequest(req, res, ctx) {
         // the key isn't bad, and freezing the pool (the old behavior) would extend
         // a momentary blip into a 30s outage.
         if (!upstreamResponse) {
+            // Streaming requests: a fetch failure here (timeout / connection reset)
+            // almost always means GLM is still prefilling a large context under load.
+            // Retrying makes GLM re-prefill from scratch — slower and never
+            // converging, which is exactly the ~10min AmbiCrew hang. Surface the
+            // error to the client instead. Non-streaming still backoff-retries.
+            if (parsedBody.stream) {
+                logger_1.logger.verbose(`[${reqId}] Stream fetch failed (${formatFetchError(lastError).summary}); not retrying (stream request)`);
+                break;
+            }
             let recovered = false;
             const maxRetries = transientMaxRetries();
             for (let r = 0; r < maxRetries; r++) {
@@ -965,7 +987,7 @@ async function handleRequest(req, res, ctx) {
                         method: 'POST',
                         headers: upstreamHeaders,
                         body: JSON.stringify(upstreamRequestBody),
-                    });
+                    }, fetchTimeoutMs);
                     upstreamResponse = retryResp;
                     if (retryResp.ok) {
                         recovered = true;
@@ -1023,7 +1045,7 @@ async function handleRequest(req, res, ctx) {
                         method: 'POST',
                         headers: upstreamHeaders,
                         body: JSON.stringify(upstreamRequestBody),
-                    });
+                    }, fetchTimeoutMs);
                     upstreamResponse = retryResp;
                     if (retryResp.ok) {
                         recovered = true;
@@ -1070,7 +1092,7 @@ async function handleRequest(req, res, ctx) {
                         method: 'POST',
                         headers: upstreamHeaders,
                         body: JSON.stringify(upstreamRequestBody),
-                    });
+                    }, fetchTimeoutMs);
                     if (retryResp.ok || retryResp.status !== 400) {
                         upstreamResponse = retryResp;
                         logger_1.logger.verbose(`[${reqId}] CodePlan success after max_tokens clamp (attempt=${credAttempt})`);
@@ -1095,7 +1117,7 @@ async function handleRequest(req, res, ctx) {
                         method: 'POST',
                         headers: upstreamHeaders,
                         body: JSON.stringify(upstreamRequestBody),
-                    });
+                    }, fetchTimeoutMs);
                     upstreamResponse = retryResp;
                     if (!upstreamResponse.ok) {
                         try {
