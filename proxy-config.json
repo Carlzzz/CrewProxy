@@ -48,7 +48,7 @@
     "gpt": {
       "baseURL": "https://zz.xingwan.store",
       "apiKey": "sk-rXTE4867NDX0A14sJPDMxQVjN2HcsD3WR3gaXJLRWPqamMG0",
-      "model": "gpt-5.5",
+      "model": "gpt-5.6-luna",
       "provider": "gpt"
     },
     "claude": {
@@ -64,7 +64,9 @@
     "MiniMax-M3": "minimax",
     "deepseek-v4-pro": "deepseek",
     "deepseek-v4-flash": "deepseek",
-    "gpt-5.5": "gpt",
+    "gpt-5.6-luna": "gpt",
+    "gpt-5.6-sol": "gpt",
+    "gpt-5.6-terra": "gpt",
     "claude-opus-4-8": "claude",
     "claude-sonnet-4-6": { "upstream": "claude", "model": "claude-sonnet-4-6" }
   }
