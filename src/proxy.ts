@@ -788,21 +788,29 @@ async function handleRequest(
   }
   const clientId = userInfo.name;
 
-  // ─── Model Permissions Check ───
-  if (userInfo.allowedModels !== undefined && userInfo.allowedModels !== null) {
-    if (!userInfo.allowedModels.includes(model)) {
-      sendErrorResponse(res, 403, `Model ${model} is not allowed for your account.`, 'permission_error');
-      return;
-    }
-  }
-
   // ─── Upstream resolution ───
+  // Resolve BEFORE the permission check so aliases (opus/sonnet/haiku) are
+  // rewritten to their real model id first. Authorization is then enforced on
+  // the real model, not the alias — otherwise granting an alias would bypass a
+  // restriction on the model it maps to (e.g. "opus" allowed but
+  // "claude-opus-4-8" not). See resolveUpstreamFromModel in config.ts.
   const resolved = resolveUpstreamFromModel(model, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
   if (!resolved) {
     sendErrorResponse(res, 403, `No upstream configured for model: ${model}`, 'permission_error');
     return;
   }
   const { upstream, modelId, upstreamRouteId } = resolved;
+
+  // ─── Model Permissions Check ───
+  // Enforce on the resolved real model id (modelId), which for an alias route
+  // is the rewritten target and for a direct request is the requested model.
+  if (userInfo.allowedModels !== undefined && userInfo.allowedModels !== null) {
+    if (!userInfo.allowedModels.includes(modelId)) {
+      const label = modelId === model ? model : `${model} (${modelId})`;
+      sendErrorResponse(res, 403, `Model ${label} is not allowed for your account.`, 'permission_error');
+      return;
+    }
+  }
 
   const codePlanPoolKey = upstreamRouteId || '__default__';
   const hasCodePlan = !!(ctx.codePlanPool && upstream.codePlanCredentials?.length);
@@ -1376,6 +1384,9 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
 
         for (const [modelName] of ctx.modelRoutesMap) {
           if (seen.has(modelName)) continue;
+          // Hidden internal aliases (opus/sonnet/haiku) route normally but are
+          // omitted from the picker so users select real model names instead.
+          if (ctx.hiddenModels?.has(modelName)) continue;
           seen.add(modelName);
           items.push({ model_id: modelName, model_alias: modelName });
         }
@@ -1392,7 +1403,15 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
 
         let filteredItems = items;
         if (userInfo.allowedModels !== null) {
-          filteredItems = items.filter(item => userInfo.allowedModels!.includes(item.model_id));
+          // Filter by the real model each item resolves to, mirroring the
+          // permission check on /v1/messages. An alias item (model_id "opus")
+          // is kept when its resolved target (e.g. "claude-opus-4-8") is
+          // allowed, so the advertised list matches what requests will accept.
+          filteredItems = items.filter(item => {
+            const r = resolveUpstreamFromModel(item.model_id, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
+            const realModel = r?.modelId ?? item.model_id;
+            return userInfo.allowedModels!.includes(realModel);
+          });
         }
 
         sendJSONResponse(res, 200, { items: filteredItems });

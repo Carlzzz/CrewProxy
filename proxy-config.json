@@ -68,6 +68,18 @@
     "gpt-5.6-sol": "gpt",
     "gpt-5.6-terra": "gpt",
     "claude-opus-4-8": "claude",
-    "claude-sonnet-4-6": { "upstream": "claude", "model": "claude-sonnet-4-6" }
-  }
+    "claude-sonnet-4-6": { "upstream": "claude", "model": "claude-sonnet-4-6" },
+    "opus": { "upstream": "glm", "model": "glm-5.2" },
+    "sonnet": { "upstream": "deepseek", "model": "deepseek-v4-pro" },
+    "haiku": { "upstream": "minimax", "model": "MiniMax-M3" },
+    "claude-opus-4-7": { "upstream": "glm", "model": "glm-5.2" },
+    "claude-haiku-4-5-20251001": { "upstream": "minimax", "model": "MiniMax-M3" }
+  },
+  "hiddenModels": [
+    "opus",
+    "sonnet",
+    "haiku",
+    "claude-opus-4-7",
+    "claude-haiku-4-5-20251001"
+  ]
 }

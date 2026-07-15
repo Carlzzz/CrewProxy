@@ -39,12 +39,19 @@ export interface ProxyConfig {
   defaultUpstream?: UpstreamConfig;
   upstreamsById?: Record<string, UpstreamConfig>;
   modelRoutes?: Record<string, string | ModelRouteTarget>;
+  /** Model keys that route normally but are hidden from the GET /models
+   * listing. Used for internal tier aliases (opus/sonnet/haiku) that Claude
+   * Code calls under the hood — they must resolve, but should not appear in
+   * the user's model picker. */
+  hiddenModels?: string[];
 }
 
 export interface ProxyRuntimeContext {
   upstreamsByIdMap: Map<string, UpstreamConfig>;
   defaultUpstream: UpstreamConfig | undefined;
   modelRoutesMap: Map<string, ModelRouteTarget>;
+  /** Model keys hidden from GET /models but still routable (internal aliases). */
+  hiddenModels?: Set<string>;
   codePlanPool?: CodePlanPoolManager;
   metrics?: MetricsCollector;
   quotaFetcher?: QuotaFetcher;
@@ -243,6 +250,12 @@ export function parseProxyConfigObject(raw: unknown): ProxyConfig {
     }
     out.modelRoutes = routes;
   }
+  if (r.hiddenModels !== undefined) {
+    if (!Array.isArray(r.hiddenModels)) {
+      throw new Error("hiddenModels must be an array of strings");
+    }
+    out.hiddenModels = r.hiddenModels.map((m) => String(m).trim()).filter((m) => m !== "");
+  }
   return out;
 }
 
@@ -266,10 +279,12 @@ export function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext 
       modelRoutesMap.set(model, normalizeModelRouteTarget(target));
     }
   }
+  const hiddenModels = new Set<string>(config.hiddenModels ?? []);
   return {
     upstreamsByIdMap,
     defaultUpstream: config.defaultUpstream,
     modelRoutesMap,
+    hiddenModels,
   };
 }
 

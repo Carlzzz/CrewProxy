@@ -32,6 +32,20 @@ test('mergeSecrets keeps current key when apiKeyMode=keep', () => {
   assert.equal(merged.upstreamsById!.glm.apiKey, 'REAL-SECRET');
 });
 
+test('mergeSecrets preserves hiddenModels when the draft does not mention it', () => {
+  // hiddenModels lives on the current config as the merge base; a draft that
+  // only touches upstreams must not drop the internal alias hiding.
+  const cur = {
+    hiddenModels: ['opus', 'sonnet', 'haiku'],
+    upstreamsById: { glm: { baseURL: 'https://x', apiKey: 'REAL', model: 'glm-5.2', provider: 'glm' } },
+  };
+  const draft = {
+    upstreamsById: { glm: { baseURL: 'https://x', apiKeyMode: 'keep', model: 'glm-5.2', provider: 'glm' } },
+  };
+  const merged = mergeSecrets(cur, draft);
+  assert.deepEqual(merged.hiddenModels, ['opus', 'sonnet', 'haiku']);
+});
+
 test('mergeSecrets keeps current key even when a draft apiKey leaks alongside apiKeyMode=keep', () => {
   // Redacted round-trip safety: a masked/placeholder value must not overwrite the real key.
   const cur: ProxyConfig = {
