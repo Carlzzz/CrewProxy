@@ -1,6 +1,23 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { formatFetchError, fetchUpstream, isTransientServerError, parseRetryAfterMs } from '../src/proxy';
+import { isTokenExceedError } from '../src/contextBudget';
+
+// ── Non-token 400 classification: gates the proxy short-circuit ──
+// A "tool id not found" 400 is a malformed-request error; retrying it across
+// credentials burns the whole pool and masks the root cause. The proxy uses
+// isTokenExceedError to distinguish it from a genuine token-exceed 400.
+test('tool-id-not-found 400 is NOT classified as token-exceed (must surface, not retry)', () => {
+  const body = JSON.stringify({
+    type: 'error',
+    error: { type: 'invalid_request_error', message: "invalid params, tool result's tool id(call_x) not found (2013)" },
+  });
+  assert.equal(isTokenExceedError(400, body), false);
+});
+
+test('a real token-exceed 400 is still classified as token-exceed (keeps trim path)', () => {
+  assert.equal(isTokenExceedError(400, 'error: maximum context length exceeded'), true);
+});
 
 // ── formatFetchError: the fix for the "Upstream request failed: unknown" hole ──
 //

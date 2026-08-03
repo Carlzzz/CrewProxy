@@ -1207,6 +1207,16 @@ async function handleRequest(
       }
     }
 
+    // ── Non-token 400: surface immediately, no cooldown / no credential switch ──
+    // 非 token 类 400 是请求本身畸形(孤儿 tool_result → "tool id not found"、
+    // schema 错误等)。换凭据只会得到同样的 400,还白烧整池并误报
+    // "credentials exhausted"。立即透传真实 400,让客户端看到根因。
+    // token 类 400 已在上面的 trim 循环处理,成功则已 break,不会到这里。
+    if (upstreamResponse.status === 400 && !isTokenExceedError(upstreamResponse.status, errText)) {
+      logger.verbose(`[${reqId}] Non-token 400 (client request error), surfacing immediately without cooldown/switch`);
+      break;
+    }
+
     // ── Mark credential cooldown on failure ──
     // **Fix #2**: classify 429 — short cooldown for QPS/concurrency bursts,
     // long cooldown only for true quota exhaustion.
@@ -1223,7 +1233,9 @@ async function handleRequest(
     }
 
     // ── Decide whether to retry with next credential ──
-    // 4xx client errors (non-429, non-400) are not retryable
+    // 4xx client errors (non-429) are not retryable. Non-token 400 已在上方
+    // 提前 break;这里保留 !== 400 是为了让 token 类 400 走完 trim 后不被
+    // 当作可重试客户端错误在此处二次拦截(它由 trim 成功或耗尽自然收口)。
     if (upstreamResponse.status >= 400 && upstreamResponse.status < 500 &&
         upstreamResponse.status !== 429 && upstreamResponse.status !== 400) {
       logger.verbose(`[${reqId}] Non-retryable client error ${upstreamResponse.status}, not switching credential`);
