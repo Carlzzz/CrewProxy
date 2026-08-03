@@ -12,6 +12,20 @@ import { handleAdminConfigRequest } from './configAdmin';
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
 
+/** Resolve a model/alias to the real upstream model, then return that model's
+ *  real context window. Used by /models to advertise the true window so clients
+ *  (AmbiCrew) can calibrate their compact threshold instead of guessing. */
+export function resolveModelContextWindow(
+  modelId: string,
+  upstreamsByIdMap: Map<string, any>,
+  defaultUpstream: any,
+  modelRoutesMap?: Map<string, any>,
+): number {
+  const r = resolveUpstreamFromModel(modelId, upstreamsByIdMap, defaultUpstream, modelRoutesMap);
+  const realModel = r?.modelId ?? modelId;
+  return getModelContextWindow(realModel).contextWindow;
+}
+
 /** Small randomised pause before retrying a different credential. Prevents
  *  a burst of concurrent retries from re-triggering rate limits in lock-step. */
 function sleepWithJitter(baseMs: number, jitterMs: number): Promise<void> {
@@ -1391,8 +1405,10 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           userInfo = authResult;
         }
 
-        const items: Array<{ model_id: string; model_alias: string }> = [];
+        const items: Array<{ model_id: string; model_alias: string; context_window: number }> = [];
         const seen = new Set<string>();
+        const windowFor = (m: string) =>
+          resolveModelContextWindow(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
 
         for (const [modelName] of ctx.modelRoutesMap) {
           if (seen.has(modelName)) continue;
@@ -1400,17 +1416,17 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           // omitted from the picker so users select real model names instead.
           if (ctx.hiddenModels?.has(modelName)) continue;
           seen.add(modelName);
-          items.push({ model_id: modelName, model_alias: modelName });
+          items.push({ model_id: modelName, model_alias: modelName, context_window: windowFor(modelName) });
         }
 
         for (const [upstreamId, upstream] of ctx.upstreamsByIdMap) {
           if (seen.has(upstream.model)) continue;
           seen.add(upstream.model);
-          items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model });
+          items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model, context_window: windowFor(upstream.model) });
         }
 
         if (ctx.defaultUpstream && !seen.has(ctx.defaultUpstream.model)) {
-          items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model });
+          items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model, context_window: windowFor(ctx.defaultUpstream.model) });
         }
 
         let filteredItems = items;
