@@ -32,11 +32,18 @@ export interface ProxyConfig {
     defaultUpstream?: UpstreamConfig;
     upstreamsById?: Record<string, UpstreamConfig>;
     modelRoutes?: Record<string, string | ModelRouteTarget>;
+    /** Model keys that route normally but are hidden from the GET /models
+     * listing. Used for internal tier aliases (opus/sonnet/haiku) that Claude
+     * Code calls under the hood — they must resolve, but should not appear in
+     * the user's model picker. */
+    hiddenModels?: string[];
 }
 export interface ProxyRuntimeContext {
     upstreamsByIdMap: Map<string, UpstreamConfig>;
     defaultUpstream: UpstreamConfig | undefined;
     modelRoutesMap: Map<string, ModelRouteTarget>;
+    /** Model keys hidden from GET /models but still routable (internal aliases). */
+    hiddenModels?: Set<string>;
     codePlanPool?: CodePlanPoolManager;
     metrics?: MetricsCollector;
     quotaFetcher?: QuotaFetcher;

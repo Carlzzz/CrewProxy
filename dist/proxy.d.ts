@@ -1,5 +1,12 @@
 import * as http from 'http';
 import { ProxyRuntimeContext } from './config';
+/** Resolve a model/alias to the real upstream model, then return that model's
+ *  real context window. Used by /models to advertise the true window so clients
+ *  (AmbiCrew) can calibrate their compact threshold instead of guessing. */
+export declare function resolveModelContextWindow(modelId: string, upstreamsByIdMap: Map<string, any>, defaultUpstream: any, modelRoutesMap?: Map<string, any>): number;
+/** Tokens removed by a context trim = estimate before − estimate after,
+ *  clamped to zero. Surfaced to the client via x-crew-trimmed-tokens (梯度 2). */
+export declare function computeTrimmedTokens(estimated: number, estimatedAfter: number): number;
 export declare function createAnthropicErrorBody(message: string, type: string): object;
 export declare function formatSSEEvent(event: string, data: unknown): string;
 export declare function fetchUpstream(url: string, init: RequestInit, timeoutMs?: number): Promise<Response>;

@@ -10,7 +10,7 @@
     "ark": {
       "baseURL": "https://ark.cn-beijing.volces.com/api/coding",
       "apiKey": "f5c4d134-0025-44c6-871f-3835e292aaa1",
-      "model": "doubao-seed-2.0-pro",
+      "model": "doubao-seed-2.1-turbo",
       "provider": "ark",
       "accessKeyId": "AKLTZTAyN2E3MWFhMDliNGMxOWIwZTBhY2QzODNjZGQxYTA",
       "secretAccessKey": "WXpkak5UQm1NRFl5TW1Vek5HWXpaR0ZoTnpnME1qTmlNRGt3TUdKbE1qQQ=="
@@ -59,7 +59,7 @@
     }
   },
   "modelRoutes": {
-    "doubao-seed-2.0-pro": "ark",
+    "doubao-seed-2.1-turbo": "ark",
     "glm-5.2": "glm",
     "MiniMax-M3": "minimax",
     "deepseek-v4-pro": "deepseek",

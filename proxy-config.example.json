@@ -4,7 +4,7 @@
   "defaultUpstream": {
     "baseURL": "https://ark.cn-beijing.volces.com/api/v3",
     "apiKey": "",
-    "model": "doubao-seed-2-0-pro-260215"
+    "model": "doubao-seed-2-1-turbo"
   },
   "upstreamsById": {
     "ali": {
@@ -16,7 +16,7 @@
     "ark": {
       "baseURL": "https://ark.cn-beijing.volces.com/api/v3",
       "apiKey": "",
-      "model": "doubao-seed-2-0-pro-260215",
+      "model": "doubao-seed-2-1-turbo",
       "provider": "ark"
     }
   }

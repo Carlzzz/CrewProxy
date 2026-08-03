@@ -33,6 +33,8 @@ var __importStar = (this && this.__importStar) || (function () {
     };
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.resolveModelContextWindow = resolveModelContextWindow;
+exports.computeTrimmedTokens = computeTrimmedTokens;
 exports.createAnthropicErrorBody = createAnthropicErrorBody;
 exports.formatSSEEvent = formatSSEEvent;
 exports.fetchUpstream = fetchUpstream;
@@ -52,6 +54,19 @@ const metricsPayload_1 = require("./metricsPayload");
 const configAdmin_1 = require("./configAdmin");
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
+/** Resolve a model/alias to the real upstream model, then return that model's
+ *  real context window. Used by /models to advertise the true window so clients
+ *  (AmbiCrew) can calibrate their compact threshold instead of guessing. */
+function resolveModelContextWindow(modelId, upstreamsByIdMap, defaultUpstream, modelRoutesMap) {
+    const r = (0, config_1.resolveUpstreamFromModel)(modelId, upstreamsByIdMap, defaultUpstream, modelRoutesMap);
+    const realModel = r?.modelId ?? modelId;
+    return (0, contextBudget_1.getModelContextWindow)(realModel).contextWindow;
+}
+/** Tokens removed by a context trim = estimate before − estimate after,
+ *  clamped to zero. Surfaced to the client via x-crew-trimmed-tokens (梯度 2). */
+function computeTrimmedTokens(estimated, estimatedAfter) {
+    return Math.max(0, estimated - estimatedAfter);
+}
 /** Small randomised pause before retrying a different credential. Prevents
  *  a burst of concurrent retries from re-triggering rate limits in lock-step. */
 function sleepWithJitter(baseMs, jitterMs) {
@@ -562,11 +577,12 @@ function readWithTimeout(reader, timeoutMs, abortSignal) {
         });
     });
 }
-async function handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, modelId, startTime, upstreamReq, extra, recordMetric) {
+async function handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, modelId, startTime, upstreamReq, extra, recordMetric, trimmedTokens = 0) {
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
+        ...(trimmedTokens > 0 && { 'x-crew-trimmed-tokens': String(trimmedTokens) }),
     });
     const state = {
         inputTokens: 0,
@@ -743,20 +759,28 @@ async function handleRequest(req, res, ctx) {
         userInfo = authResult;
     }
     const clientId = userInfo.name;
-    // ─── Model Permissions Check ───
-    if (userInfo.allowedModels !== undefined && userInfo.allowedModels !== null) {
-        if (!userInfo.allowedModels.includes(model)) {
-            sendErrorResponse(res, 403, `Model ${model} is not allowed for your account.`, 'permission_error');
-            return;
-        }
-    }
     // ─── Upstream resolution ───
+    // Resolve BEFORE the permission check so aliases (opus/sonnet/haiku) are
+    // rewritten to their real model id first. Authorization is then enforced on
+    // the real model, not the alias — otherwise granting an alias would bypass a
+    // restriction on the model it maps to (e.g. "opus" allowed but
+    // "claude-opus-4-8" not). See resolveUpstreamFromModel in config.ts.
     const resolved = (0, config_1.resolveUpstreamFromModel)(model, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
     if (!resolved) {
         sendErrorResponse(res, 403, `No upstream configured for model: ${model}`, 'permission_error');
         return;
     }
     const { upstream, modelId, upstreamRouteId } = resolved;
+    // ─── Model Permissions Check ───
+    // Enforce on the resolved real model id (modelId), which for an alias route
+    // is the rewritten target and for a direct request is the requested model.
+    if (userInfo.allowedModels !== undefined && userInfo.allowedModels !== null) {
+        if (!userInfo.allowedModels.includes(modelId)) {
+            const label = modelId === model ? model : `${model} (${modelId})`;
+            sendErrorResponse(res, 403, `Model ${label} is not allowed for your account.`, 'permission_error');
+            return;
+        }
+    }
     const codePlanPoolKey = upstreamRouteId || '__default__';
     const hasCodePlan = !!(ctx.codePlanPool && upstream.codePlanCredentials?.length);
     // ─── Build Anthropic request (no format conversion) ───
@@ -788,6 +812,7 @@ async function handleRequest(req, res, ctx) {
     }
     let upstreamRequestBody = anthropicReq;
     // ─── Context budget: pre-flight trim ───
+    let trimmedTokens = 0;
     {
         const effectiveModelForBudget = modelId || upstream.model;
         const requestedMaxOutput = upstreamRequestBody.max_tokens;
@@ -797,9 +822,17 @@ async function handleRequest(req, res, ctx) {
             const trimResult = (0, contextBudget_1.trimToFitBudget)(upstreamRequestBody, inputBudget);
             if (trimResult.trimmed) {
                 upstreamRequestBody = trimResult.trimmedBody;
+                trimmedTokens = computeTrimmedTokens(estimated, trimResult.estimatedTokens);
                 logger_1.logger.verbose(`[${reqId}] Context budget: trimmed from ~${estimated} to ~${trimResult.estimatedTokens} tokens (budget: ${inputBudget}). Actions: ${trimResult.actions.join('; ')}`);
             }
         }
+    }
+    // 发送前配对闸门(梯度 4):无条件剥离孤儿 tool_result(无论上面是否 trim)。
+    // 孤儿可能来自 trim,也可能本就存在于客户端请求里;二者都在此统一堵住,避免
+    // 原样透传给上游触发 400 "tool id not found"。幂等,与 trim 内清理重复无害。
+    // 放在 pristine 快照之前,使所有凭据重试(从 pristine reset)都继承干净 body。
+    if (Array.isArray(upstreamRequestBody.messages)) {
+        (0, contextBudget_1.stripOrphanedToolResults)(upstreamRequestBody.messages);
     }
     // Save a pristine copy of the request body so we can reset after failed attempts
     const pristineRequestBody = structuredClone(upstreamRequestBody);
@@ -1139,6 +1172,15 @@ async function handleRequest(req, res, ctx) {
                 break;
             }
         }
+        // ── Non-token 400: surface immediately, no cooldown / no credential switch ──
+        // 非 token 类 400 是请求本身畸形(孤儿 tool_result → "tool id not found"、
+        // schema 错误等)。换凭据只会得到同样的 400,还白烧整池并误报
+        // "credentials exhausted"。立即透传真实 400,让客户端看到根因。
+        // token 类 400 已在上面的 trim 循环处理,成功则已 break,不会到这里。
+        if (upstreamResponse.status === 400 && !(0, contextBudget_1.isTokenExceedError)(upstreamResponse.status, errText)) {
+            logger_1.logger.verbose(`[${reqId}] Non-token 400 (client request error), surfacing immediately without cooldown/switch`);
+            break;
+        }
         // ── Mark credential cooldown on failure ──
         // **Fix #2**: classify 429 — short cooldown for QPS/concurrency bursts,
         // long cooldown only for true quota exhaustion.
@@ -1155,7 +1197,9 @@ async function handleRequest(req, res, ctx) {
             logger_1.logger.verbose(`[${reqId}] CodePlan cooldown for ${pickedCredentialId}: ${cooldownMs}ms (class=${cls})`);
         }
         // ── Decide whether to retry with next credential ──
-        // 4xx client errors (non-429, non-400) are not retryable
+        // 4xx client errors (non-429) are not retryable. Non-token 400 已在上方
+        // 提前 break;这里保留 !== 400 是为了让 token 类 400 走完 trim 后不被
+        // 当作可重试客户端错误在此处二次拦截(它由 trim 成功或耗尽自然收口)。
         if (upstreamResponse.status >= 400 && upstreamResponse.status < 500 &&
             upstreamResponse.status !== 429 && upstreamResponse.status !== 400) {
             logger_1.logger.verbose(`[${reqId}] Non-retryable client error ${upstreamResponse.status}, not switching credential`);
@@ -1230,7 +1274,7 @@ async function handleRequest(req, res, ctx) {
             return;
         }
         if (parsedBody.stream) {
-            await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric);
+            await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric, trimmedTokens);
             return;
         }
         // ─── Non-stream response: pass Anthropic response directly ───
@@ -1258,6 +1302,8 @@ async function handleRequest(req, res, ctx) {
             response_size: JSON.stringify(anthropicResp).length,
         });
         recordMetric(true, inputTokens, outputTokens);
+        if (trimmedTokens > 0)
+            res.setHeader('x-crew-trimmed-tokens', String(trimmedTokens));
         sendJSONResponse(res, 200, anthropicResp);
     }
     finally {
@@ -1301,24 +1347,37 @@ function createProxyServer(ctx) {
                 }
                 const items = [];
                 const seen = new Set();
+                const windowFor = (m) => resolveModelContextWindow(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
                 for (const [modelName] of ctx.modelRoutesMap) {
                     if (seen.has(modelName))
                         continue;
+                    // Hidden internal aliases (opus/sonnet/haiku) route normally but are
+                    // omitted from the picker so users select real model names instead.
+                    if (ctx.hiddenModels?.has(modelName))
+                        continue;
                     seen.add(modelName);
-                    items.push({ model_id: modelName, model_alias: modelName });
+                    items.push({ model_id: modelName, model_alias: modelName, context_window: windowFor(modelName) });
                 }
                 for (const [upstreamId, upstream] of ctx.upstreamsByIdMap) {
                     if (seen.has(upstream.model))
                         continue;
                     seen.add(upstream.model);
-                    items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model });
+                    items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model, context_window: windowFor(upstream.model) });
                 }
                 if (ctx.defaultUpstream && !seen.has(ctx.defaultUpstream.model)) {
-                    items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model });
+                    items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model, context_window: windowFor(ctx.defaultUpstream.model) });
                 }
                 let filteredItems = items;
                 if (userInfo.allowedModels !== null) {
-                    filteredItems = items.filter(item => userInfo.allowedModels.includes(item.model_id));
+                    // Filter by the real model each item resolves to, mirroring the
+                    // permission check on /v1/messages. An alias item (model_id "opus")
+                    // is kept when its resolved target (e.g. "claude-opus-4-8") is
+                    // allowed, so the advertised list matches what requests will accept.
+                    filteredItems = items.filter(item => {
+                        const r = (0, config_1.resolveUpstreamFromModel)(item.model_id, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
+                        const realModel = r?.modelId ?? item.model_id;
+                        return userInfo.allowedModels.includes(realModel);
+                    });
                 }
                 sendJSONResponse(res, 200, { items: filteredItems });
                 return;

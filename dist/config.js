@@ -181,6 +181,12 @@ function parseProxyConfigObject(raw) {
         }
         out.modelRoutes = routes;
     }
+    if (r.hiddenModels !== undefined) {
+        if (!Array.isArray(r.hiddenModels)) {
+            throw new Error("hiddenModels must be an array of strings");
+        }
+        out.hiddenModels = r.hiddenModels.map((m) => String(m).trim()).filter((m) => m !== "");
+    }
     return out;
 }
 function normalizeModelRouteTarget(v) {
@@ -202,10 +208,12 @@ function buildUpstreamsByIdMap(config) {
             modelRoutesMap.set(model, normalizeModelRouteTarget(target));
         }
     }
+    const hiddenModels = new Set(config.hiddenModels ?? []);
     return {
         upstreamsByIdMap,
         defaultUpstream: config.defaultUpstream,
         modelRoutesMap,
+        hiddenModels,
     };
 }
 function resolveUpstreamFromModel(modelStr, upstreamsByIdMap, defaultUpstream, modelRoutesMap) {
