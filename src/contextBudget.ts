@@ -10,27 +10,28 @@ interface ModelContextSpec {
 
 const MODEL_CONTEXT_SPECS: ModelContextSpec[] = [
   { pattern: /^gpt-4\.1/i,        contextWindow: 1_048_576, maxOutputTokens: 32_768 },
-  { pattern: /^gpt-4o/i,          contextWindow: 128_000,   maxOutputTokens: 16_384 },
-  { pattern: /^gpt-4-turbo/i,     contextWindow: 128_000,   maxOutputTokens: 4_096 },
+  { pattern: /^gpt-4o/i,          contextWindow: 128_000,   maxOutputTokens: 32_768 },
+  { pattern: /^gpt-4-turbo/i,     contextWindow: 128_000,   maxOutputTokens: 32_768 },
   { pattern: /^gpt-5\.6/i,        contextWindow: 272_000,   maxOutputTokens: 32_768 },
   { pattern: /^gpt-5/i,           contextWindow: 1_048_576, maxOutputTokens: 32_768 },
-  { pattern: /^o[134]/i,          contextWindow: 200_000,   maxOutputTokens: 100_000 },
-  { pattern: /^gemini-2/i,        contextWindow: 1_048_576, maxOutputTokens: 8_192 },
-  { pattern: /^gemini-1\.5/i,     contextWindow: 1_048_576, maxOutputTokens: 8_192 },
-  { pattern: /^deepseek-v4/i,     contextWindow: 1_000_000, maxOutputTokens: 65_536 },
-  { pattern: /^deepseek/i,        contextWindow: 64_000,    maxOutputTokens: 8_192 },
-  { pattern: /^kimi/i,            contextWindow: 262_144,   maxOutputTokens: 8_192 },
-  { pattern: /^qwen3\.5/i,        contextWindow: 262_144,   maxOutputTokens: 16_384 },
-  { pattern: /^qwen/i,            contextWindow: 131_072,   maxOutputTokens: 8_192 },
-  { pattern: /^doubao-seed/i,     contextWindow: 200_000,   maxOutputTokens: 8_192 },
-  { pattern: /^doubao/i,          contextWindow: 128_000,   maxOutputTokens: 4_096 },
-  { pattern: /^minimax-m3/i,      contextWindow: 1_048_576, maxOutputTokens: 16_384 },
-  { pattern: /^minimax/i,         contextWindow: 245_760,   maxOutputTokens: 16_384 },
-  { pattern: /^claude-opus-4-8/i, contextWindow: 1_000_000, maxOutputTokens: 8_192 },
-  { pattern: /^claude/i,          contextWindow: 200_000,   maxOutputTokens: 8_192 },
-  { pattern: /^glm-5\.2/i,        contextWindow: 1_000_000, maxOutputTokens: 4_096 },
-  { pattern: /^glm/i,             contextWindow: 128_000,   maxOutputTokens: 4_096 },
-  { pattern: /^yi-/i,             contextWindow: 200_000,   maxOutputTokens: 4_096 },
+  { pattern: /^o[134]/i,          contextWindow: 200_000,   maxOutputTokens: 32_768 },
+  { pattern: /^gemini-2/i,        contextWindow: 1_048_576, maxOutputTokens: 32_768 },
+  { pattern: /^gemini-1\.5/i,     contextWindow: 1_048_576, maxOutputTokens: 32_768 },
+  { pattern: /^deepseek-v4/i,     contextWindow: 1_000_000, maxOutputTokens: 32_768 },
+  { pattern: /^deepseek/i,        contextWindow: 64_000,    maxOutputTokens: 32_768 },
+  { pattern: /^kimi/i,            contextWindow: 262_144,   maxOutputTokens: 32_768 },
+  { pattern: /^qwen3\.5/i,        contextWindow: 262_144,   maxOutputTokens: 32_768 },
+  { pattern: /^qwen/i,            contextWindow: 131_072,   maxOutputTokens: 32_768 },
+  { pattern: /^doubao-seed[-.]?2\.?1/i, contextWindow: 200_000, maxOutputTokens: 32_768 },
+  { pattern: /^doubao-seed/i,     contextWindow: 200_000,   maxOutputTokens: 32_768 },
+  { pattern: /^doubao/i,          contextWindow: 128_000,   maxOutputTokens: 32_768 },
+  { pattern: /^minimax-m3/i,      contextWindow: 1_048_576, maxOutputTokens: 32_768 },
+  { pattern: /^minimax/i,         contextWindow: 245_760,   maxOutputTokens: 32_768 },
+  { pattern: /^claude-opus-4-8/i, contextWindow: 1_000_000, maxOutputTokens: 32_768 },
+  { pattern: /^claude/i,          contextWindow: 200_000,   maxOutputTokens: 32_768 },
+  { pattern: /^glm-5\.2/i,        contextWindow: 1_000_000, maxOutputTokens: 32_768 },
+  { pattern: /^glm/i,             contextWindow: 128_000,   maxOutputTokens: 32_768 },
+  { pattern: /^yi-/i,             contextWindow: 200_000,   maxOutputTokens: 32_768 },
 ];
 
 const DEFAULT_CONTEXT_WINDOW = 64_000;
@@ -404,6 +405,42 @@ const TOKEN_EXCEED_PATTERNS = [
 export function isTokenExceedError(status: number, bodyText: string): boolean {
   if (status !== 400) return false;
   return TOKEN_EXCEED_PATTERNS.some(p => p.test(bodyText));
+}
+
+/**
+ * 原地剥离孤儿 tool_result:删除所有 tool_use_id 找不到对应 tool_use 的
+ * tool_result 块。若某条消息的 content 因此变空,整条删除。
+ *
+ * 覆盖 trimToFitBudget / aggressiveTrimForRetry 的整块级配对删除处理不到的
+ * “混合块级孤儿”(一条 user 消息里既有孤儿 tool_result 又有正常内容)。
+ * 只处理孤儿 tool_result 一个方向;tool_use 无 result 是 Anthropic 允许的
+ * 中间态,不在此处理。
+ */
+export function stripOrphanedToolResults(messages: any[]): void {
+  const validUseIds = new Set<string>();
+  for (const msg of messages) {
+    if (Array.isArray(msg?.content)) {
+      for (const block of msg.content) {
+        if (block?.type === 'tool_use' && block.id) validUseIds.add(block.id);
+      }
+    }
+  }
+
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!Array.isArray(msg?.content)) continue;
+    const filtered = msg.content.filter(
+      (block: any) =>
+        !(block?.type === 'tool_result' && !validUseIds.has(block.tool_use_id)),
+    );
+    if (filtered.length === msg.content.length) continue;
+    if (filtered.length === 0) {
+      messages.splice(i, 1);
+      i--;
+    } else {
+      msg.content = filtered;
+    }
+  }
 }
 
 // 鈹€鈹€鈹€ Aggressive trim for retry (Anthropic format) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
