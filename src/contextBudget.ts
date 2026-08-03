@@ -316,6 +316,10 @@ export function trimToFitBudget(body: any, inputBudget: number): TrimResult {
     protectFrom = findProtectedTailIndex(messages);
   }
   if (removedCount > 0) actions.push(`removed ${removedCount} oldest messages`);
+  // 删除老消息可能拆散跨消息的 tool_use/tool_result 配对(或 body 本就带孤儿)。
+  // 统一剥离孤儿 tool_result,覆盖下面 320/388 两个 return(Phase 4 只截断文本
+  // 不删消息,不会再产生孤儿)。
+  stripOrphanedToolResults(messages);
   if (currentEstimate <= inputBudget) {
     return { trimmed: true, trimmedBody: trimmed, estimatedTokens: currentEstimate, actions };
   }
@@ -537,6 +541,10 @@ export function aggressiveTrimForRetry(body: any, round: number = 0): any {
       }
     }
   }
+
+  // 兜底剥离整条级 allOrphaned 清理漏掉的混合块级孤儿(messages 是 trimmed.messages
+  // 同一引用,原地剥离即生效)。
+  stripOrphanedToolResults(messages);
 
   return trimmed;
 }
