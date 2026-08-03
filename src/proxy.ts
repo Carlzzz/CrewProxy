@@ -5,7 +5,7 @@ import { CodePlanPoolManager, CODE_PLAN_COOLDOWN_MS, CODE_PLAN_SHORT_COOLDOWN_MS
 import { classify429, parseQuotaResetEpochMs } from './codePlanQuota';
 import { buildAnthropicMessagesURL } from './formatTransform';
 import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
-import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow } from './contextBudget';
+import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow, stripOrphanedToolResults } from './contextBudget';
 import { buildMetricsPayload } from './metricsPayload';
 import { handleAdminConfigRequest } from './configAdmin';
 
@@ -886,6 +886,14 @@ async function handleRequest(
         logger.verbose(`[${reqId}] Context budget: trimmed from ~${estimated} to ~${trimResult.estimatedTokens} tokens (budget: ${inputBudget}). Actions: ${trimResult.actions.join('; ')}`);
       }
     }
+  }
+
+  // 发送前配对闸门(梯度 4):无条件剥离孤儿 tool_result(无论上面是否 trim)。
+  // 孤儿可能来自 trim,也可能本就存在于客户端请求里;二者都在此统一堵住,避免
+  // 原样透传给上游触发 400 "tool id not found"。幂等,与 trim 内清理重复无害。
+  // 放在 pristine 快照之前,使所有凭据重试(从 pristine reset)都继承干净 body。
+  if (Array.isArray(upstreamRequestBody.messages)) {
+    stripOrphanedToolResults(upstreamRequestBody.messages);
   }
 
   // Save a pristine copy of the request body so we can reset after failed attempts
