@@ -26,6 +26,12 @@ export function resolveModelContextWindow(
   return getModelContextWindow(realModel).contextWindow;
 }
 
+/** Tokens removed by a context trim = estimate before − estimate after,
+ *  clamped to zero. Surfaced to the client via x-crew-trimmed-tokens (梯度 2). */
+export function computeTrimmedTokens(estimated: number, estimatedAfter: number): number {
+  return Math.max(0, estimated - estimatedAfter);
+}
+
 /** Small randomised pause before retrying a different credential. Prevents
  *  a burst of concurrent retries from re-triggering rate limits in lock-step. */
 function sleepWithJitter(baseMs: number, jitterMs: number): Promise<void> {
@@ -601,11 +607,13 @@ async function handleAnthropicStreamResponse(
   upstreamReq: any,
   extra: Partial<UsageLogExtra>,
   recordMetric?: (success: boolean, inputTokens: number, outputTokens: number) => void,
+  trimmedTokens: number = 0,
 ): Promise<void> {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
+    ...(trimmedTokens > 0 && { 'x-crew-trimmed-tokens': String(trimmedTokens) }),
   });
 
   const state: AnthropicStreamState = {
@@ -863,6 +871,7 @@ async function handleRequest(
   let upstreamRequestBody: any = anthropicReq;
 
   // ─── Context budget: pre-flight trim ───
+  let trimmedTokens = 0;
   {
     const effectiveModelForBudget = modelId || upstream.model;
     const requestedMaxOutput = upstreamRequestBody.max_tokens;
@@ -873,6 +882,7 @@ async function handleRequest(
       const trimResult = trimToFitBudget(upstreamRequestBody, inputBudget);
       if (trimResult.trimmed) {
         upstreamRequestBody = trimResult.trimmedBody;
+        trimmedTokens = computeTrimmedTokens(estimated, trimResult.estimatedTokens);
         logger.verbose(`[${reqId}] Context budget: trimmed from ~${estimated} to ~${trimResult.estimatedTokens} tokens (budget: ${inputBudget}). Actions: ${trimResult.actions.join('; ')}`);
       }
     }
@@ -1327,7 +1337,7 @@ async function handleRequest(
       return;
     }
     if (parsedBody.stream) {
-      await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric);
+      await handleAnthropicStreamResponse(upstreamResponse, req, res, clientId, effectiveModel, startTime, upstreamRequestBody, usageExtra, recordMetric, trimmedTokens);
       return;
     }
 
@@ -1358,6 +1368,7 @@ async function handleRequest(
     } as UsageLogExtra);
 
     recordMetric(true, inputTokens, outputTokens);
+    if (trimmedTokens > 0) res.setHeader('x-crew-trimmed-tokens', String(trimmedTokens));
     sendJSONResponse(res, 200, anthropicResp);
   } finally {
     releasePick();
