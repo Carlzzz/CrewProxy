@@ -681,6 +681,8 @@ async function handleAnthropicStreamResponse(
           // MiniMax M3 reports real input_tokens in message_delta, not in message_start
           state.inputTokens = Math.max(state.inputTokens, data.usage.input_tokens ?? data.usage.prompt_tokens ?? 0);
           state.outputTokens = Math.max(state.outputTokens, data.usage.output_tokens ?? data.usage.completion_tokens ?? 0);
+          // GLM 等 provider 可能只在 message_delta 里上报缓存命中字段（prompt_tokens_details.cached_tokens 等）
+          state.cachedInputTokens = Math.max(state.cachedInputTokens, extractCachedInputTokensFromUsage(data.usage));
         }
         if (eventType === 'message_stop') {
           state.sawMessageStop = true;
