@@ -24,6 +24,9 @@ export interface UsageLogExtra {
   /** Short error summary for failed requests (network error code, upstream
    *  error text, or "all credentials exhausted"). null on success. */
   error?: string;
+  /** Distinguishes websearch records from llm records. Only set on websearch
+   *  calls; llm records omit it so historical data is unchanged. */
+  kind?: string;
 }
 
 export function formatUTC8(date: Date): string {
@@ -110,6 +113,7 @@ export function appendUsageLog(
       const e = extra;
       const record = {
         app: e?.app ?? 'woicrew',
+        ...(e?.kind !== undefined ? { kind: e.kind } : {}),
         clientid,
         username: e?.username ?? null,
         modelid,
