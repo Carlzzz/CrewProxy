@@ -28,6 +28,11 @@ export interface UpstreamConfig {
   secretAccessKey?: string;
 }
 
+export interface WebSearchConfig {
+  tavilyApiKey?: string;
+  braveApiKey?: string;
+}
+
 export interface ModelRouteTarget {
   upstream: string;
   model?: string;
@@ -44,6 +49,7 @@ export interface ProxyConfig {
    * Code calls under the hood — they must resolve, but should not appear in
    * the user's model picker. */
   hiddenModels?: string[];
+  webSearch?: WebSearchConfig;
 }
 
 export interface ProxyRuntimeContext {
@@ -56,6 +62,7 @@ export interface ProxyRuntimeContext {
   metrics?: MetricsCollector;
   quotaFetcher?: QuotaFetcher;
   tokenUsage?: TokenUsageTracker;
+  webSearch?: WebSearchConfig;
 }
 
 import type { CodePlanPoolManager } from './codePlanPool';
@@ -133,6 +140,16 @@ export function normalizeUpstream(u: unknown): UpstreamConfig {
   if (typeof o.secretAccessKey === 'string' && o.secretAccessKey) {
     out.secretAccessKey = o.secretAccessKey;
   }
+  return out;
+}
+
+function normalizeWebSearch(v: unknown): WebSearchConfig {
+  if (v === undefined || v === null) return {};
+  if (typeof v !== 'object') throw new Error('webSearch must be an object');
+  const o = v as Record<string, unknown>;
+  const out: WebSearchConfig = {};
+  if (typeof o.tavilyApiKey === 'string' && o.tavilyApiKey) out.tavilyApiKey = o.tavilyApiKey;
+  if (typeof o.braveApiKey === 'string' && o.braveApiKey) out.braveApiKey = o.braveApiKey;
   return out;
 }
 
@@ -256,6 +273,9 @@ export function parseProxyConfigObject(raw: unknown): ProxyConfig {
     }
     out.hiddenModels = r.hiddenModels.map((m) => String(m).trim()).filter((m) => m !== "");
   }
+  if (r.webSearch !== undefined) {
+    out.webSearch = normalizeWebSearch(r.webSearch);
+  }
   return out;
 }
 
@@ -285,6 +305,7 @@ export function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext 
     defaultUpstream: config.defaultUpstream,
     modelRoutesMap,
     hiddenModels,
+    webSearch: config.webSearch,
   };
 }
 

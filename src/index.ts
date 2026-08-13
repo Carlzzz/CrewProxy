@@ -152,6 +152,7 @@ if (fs.existsSync(configFilePath)) {
         ctx.upstreamsByIdMap = newCtx.upstreamsByIdMap;
         ctx.defaultUpstream = newCtx.defaultUpstream;
         ctx.modelRoutesMap = newCtx.modelRoutesMap;
+        ctx.webSearch = newCtx.webSearch;
         codePlanPool.reconcileFromConfig(newConfig);
         currentConfig = newConfig;
         quotaFetcher.reload(buildQuotaUpstreams(newConfig));

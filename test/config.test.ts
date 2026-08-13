@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeUpstream } from '../src/config';
+import { normalizeUpstream, parseProxyConfigObject } from '../src/config';
 
 test('normalizeUpstream parses quotaLimits', () => {
   const u = normalizeUpstream({
@@ -41,4 +41,21 @@ test('normalizeUpstream ignores invalid quotaMode', () => {
     baseURL: 'https://x.com', apiKey: 'x', model: 'm', quotaMode: 'bogus',
   });
   assert.equal(u.quotaMode, undefined);
+});
+
+test('parseProxyConfigObject parses webSearch keys', () => {
+  const cfg = parseProxyConfigObject({
+    webSearch: { tavilyApiKey: 'tvly-x', braveApiKey: 'BSA-y' },
+  });
+  assert.deepEqual(cfg.webSearch, { tavilyApiKey: 'tvly-x', braveApiKey: 'BSA-y' });
+});
+
+test('parseProxyConfigObject leaves webSearch undefined when absent', () => {
+  const cfg = parseProxyConfigObject({ port: 3456 });
+  assert.equal(cfg.webSearch, undefined);
+});
+
+test('parseProxyConfigObject ignores non-string webSearch keys', () => {
+  const cfg = parseProxyConfigObject({ webSearch: { tavilyApiKey: 123, braveApiKey: '' } });
+  assert.deepEqual(cfg.webSearch, {});
 });
