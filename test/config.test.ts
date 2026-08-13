@@ -59,3 +59,8 @@ test('parseProxyConfigObject ignores non-string webSearch keys', () => {
   const cfg = parseProxyConfigObject({ webSearch: { tavilyApiKey: 123, braveApiKey: '' } });
   assert.deepEqual(cfg.webSearch, {});
 });
+
+test('parseProxyConfigObject parses bochaApiKey', () => {
+  const cfg = parseProxyConfigObject({ webSearch: { bochaApiKey: 'sk-bocha' } });
+  assert.deepEqual(cfg.webSearch, { bochaApiKey: 'sk-bocha' });
+});

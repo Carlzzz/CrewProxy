@@ -31,6 +31,7 @@ export interface UpstreamConfig {
 export interface WebSearchConfig {
   tavilyApiKey?: string;
   braveApiKey?: string;
+  bochaApiKey?: string;
 }
 
 export interface ModelRouteTarget {
@@ -150,6 +151,7 @@ function normalizeWebSearch(v: unknown): WebSearchConfig {
   const out: WebSearchConfig = {};
   if (typeof o.tavilyApiKey === 'string' && o.tavilyApiKey) out.tavilyApiKey = o.tavilyApiKey;
   if (typeof o.braveApiKey === 'string' && o.braveApiKey) out.braveApiKey = o.braveApiKey;
+  if (typeof o.bochaApiKey === 'string' && o.bochaApiKey) out.bochaApiKey = o.bochaApiKey;
   return out;
 }
 

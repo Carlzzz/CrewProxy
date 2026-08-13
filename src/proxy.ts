@@ -8,7 +8,7 @@ import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
 import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow, stripOrphanedToolResults } from './contextBudget';
 import { buildMetricsPayload } from './metricsPayload';
 import { handleAdminConfigRequest } from './configAdmin';
-import { searchTavily, searchBrave } from './webSearch';
+import { searchTavily, searchBrave, searchBocha } from './webSearch';
 
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
@@ -1431,12 +1431,12 @@ async function handleWebSearchRequest(
   const username = authResult.name;
   const ws = ctx.webSearch;
 
-  // provider 选择：client 指定则校验；未指定则 tavily → brave fallback
+  // provider 选择：client 指定则校验；未指定则 tavily → brave → bocha fallback
   const requestedProvider = body.provider;
-  let provider: 'tavily' | 'brave';
-  if (requestedProvider === 'tavily' || requestedProvider === 'brave') {
+  let provider: 'tavily' | 'brave' | 'bocha';
+  if (requestedProvider === 'tavily' || requestedProvider === 'brave' || requestedProvider === 'bocha') {
     provider = requestedProvider;
-    const key = provider === 'tavily' ? ws?.tavilyApiKey : ws?.braveApiKey;
+    const key = provider === 'tavily' ? ws?.tavilyApiKey : provider === 'brave' ? ws?.braveApiKey : ws?.bochaApiKey;
     if (!key) {
       sendErrorResponse(res, 400, `Web search provider ${provider} is not configured`, 'invalid_request_error');
       return;
@@ -1444,6 +1444,7 @@ async function handleWebSearchRequest(
   } else if (requestedProvider === undefined || requestedProvider === null || requestedProvider === '') {
     if (ws?.tavilyApiKey) provider = 'tavily';
     else if (ws?.braveApiKey) provider = 'brave';
+    else if (ws?.bochaApiKey) provider = 'bocha';
     else {
       sendErrorResponse(res, 400, 'Web search is not configured', 'invalid_request_error');
       return;
@@ -1453,7 +1454,7 @@ async function handleWebSearchRequest(
     return;
   }
 
-  const apiKey = provider === 'tavily' ? ws!.tavilyApiKey! : ws!.braveApiKey!;
+  const apiKey = provider === 'tavily' ? ws!.tavilyApiKey! : provider === 'brave' ? ws!.braveApiKey! : ws!.bochaApiKey!;
   const allowed = Array.isArray(body.allowed_domains) ? body.allowed_domains.filter((d: unknown) => typeof d === 'string') : undefined;
   const blocked = Array.isArray(body.blocked_domains) ? body.blocked_domains.filter((d: unknown) => typeof d === 'string') : undefined;
   const sessionId = typeof req.headers['x-woicrew-session-id'] === 'string' && req.headers['x-woicrew-session-id']
@@ -1462,7 +1463,9 @@ async function handleWebSearchRequest(
   try {
     const hits = provider === 'tavily'
       ? await searchTavily(query, apiKey, allowed, blocked, AbortSignal.timeout(15000))
-      : await searchBrave(query, apiKey, allowed, blocked, AbortSignal.timeout(15000));
+      : provider === 'brave'
+        ? await searchBrave(query, apiKey, allowed, blocked, AbortSignal.timeout(15000))
+        : await searchBocha(query, apiKey, allowed, blocked, AbortSignal.timeout(15000));
     appendUsageLog(username, provider, startTime, 0, 0, {
       app: 'woicrew',
       username,

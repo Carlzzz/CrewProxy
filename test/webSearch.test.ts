@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseTavilyResponse, parseBraveResponse, applyDomainFiltersToQuery } from '../src/webSearch';
+import { parseTavilyResponse, parseBraveResponse, parseBochaResponse, applyDomainFiltersToQuery } from '../src/webSearch';
 
 test('parseTavilyResponse maps title/url and drops malformed hits', () => {
   const hits = parseTavilyResponse({ results: [
@@ -25,4 +25,12 @@ test('applyDomainFiltersToQuery builds site: clauses', () => {
 
 test('applyDomainFiltersToQuery is query-only when no domains', () => {
   assert.equal(applyDomainFiltersToQuery('hello'), 'hello');
+});
+
+test('parseBochaResponse maps data.webPages.value name/url and drops malformed', () => {
+  const hits = parseBochaResponse({ data: { webPages: { value: [
+    { name: '博查标题', url: 'https://a.com' },
+    { name: 1, url: 'https://b.com' },
+  ]}}});
+  assert.deepEqual(hits, [{ title: '博查标题', url: 'https://a.com' }]);
 });

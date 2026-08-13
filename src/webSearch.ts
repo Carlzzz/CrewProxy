@@ -79,3 +79,35 @@ export async function searchBrave(
   }
   return parseBraveResponse(await response.json());
 }
+
+export function parseBochaResponse(body: unknown): WebSearchHit[] {
+  const b = body as { data?: { webPages?: { value?: Array<{ name?: unknown; url?: unknown }> } } } | null | undefined;
+  return (b?.data?.webPages?.value ?? [])
+    .map(h => normalizeHit(h?.name, h?.url))
+    .filter((h): h is WebSearchHit => h != null);
+}
+
+export async function searchBocha(
+  query: string,
+  apiKey: string,
+  allowedDomains?: string[],
+  blockedDomains?: string[],
+  signal?: AbortSignal,
+): Promise<WebSearchHit[]> {
+  const response = await fetch('https://api.bocha.cn/v1/web-search', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query,
+      count: 8,
+      freshness: 'noLimit',
+      include: allowedDomains?.filter(Boolean).join('|') || undefined,
+      exclude: blockedDomains?.filter(Boolean).join('|') || undefined,
+    }),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`Bocha search failed: ${response.status}`);
+  }
+  return parseBochaResponse(await response.json());
+}
