@@ -8,6 +8,7 @@ import { appendUsageLog, formatUTC8, UsageLogExtra } from './usageLogger';
 import { estimateRequestTokens, computeInputBudget, trimToFitBudget, isTokenExceedError, aggressiveTrimForRetry, getModelContextWindow, stripOrphanedToolResults } from './contextBudget';
 import { buildMetricsPayload } from './metricsPayload';
 import { handleAdminConfigRequest } from './configAdmin';
+import { searchTavily, searchBrave } from './webSearch';
 
 const MAX_REQUEST_BODY_BYTES = 20 * 1024 * 1024;
 const STREAM_READ_TIMEOUT_MS = 180_000;
@@ -1385,6 +1386,105 @@ async function handleRequest(
   }
 }
 
+// ─── WebSearch request handler ───
+
+async function handleWebSearchRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  ctx: ProxyRuntimeContext,
+): Promise<void> {
+  const startTime = formatUTC8(new Date());
+  let rawBody: Buffer;
+  try {
+    rawBody = await readRequestBody(req);
+  } catch (err: any) {
+    sendErrorResponse(res, 400, err.message || 'Invalid request body', 'invalid_request_error');
+    return;
+  }
+  let body: any;
+  try {
+    body = JSON.parse(rawBody.toString('utf-8'));
+  } catch {
+    sendErrorResponse(res, 400, 'Invalid JSON in request body', 'invalid_request_error');
+    return;
+  }
+  const query = typeof body.query === 'string' ? body.query.trim() : '';
+  if (!query) {
+    sendErrorResponse(res, 400, 'Missing or invalid "query" in request body', 'invalid_request_error');
+    return;
+  }
+
+  const clientApiKey = extractClientApiKey(req);
+  if (!clientApiKey) {
+    sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
+    return;
+  }
+  const authResult = await authenticateRequest(clientApiKey);
+  if (!authResult) {
+    sendErrorResponse(res, 401, 'Invalid API key', 'authentication_error');
+    return;
+  }
+  const username = authResult.name;
+  const ws = ctx.webSearch;
+
+  // provider 选择：client 指定则校验；未指定则 tavily → brave fallback
+  const requestedProvider = body.provider;
+  let provider: 'tavily' | 'brave';
+  if (requestedProvider === 'tavily' || requestedProvider === 'brave') {
+    provider = requestedProvider;
+    const key = provider === 'tavily' ? ws?.tavilyApiKey : ws?.braveApiKey;
+    if (!key) {
+      sendErrorResponse(res, 400, `Web search provider ${provider} is not configured`, 'invalid_request_error');
+      return;
+    }
+  } else if (requestedProvider === undefined || requestedProvider === null || requestedProvider === '') {
+    if (ws?.tavilyApiKey) provider = 'tavily';
+    else if (ws?.braveApiKey) provider = 'brave';
+    else {
+      sendErrorResponse(res, 400, 'Web search is not configured', 'invalid_request_error');
+      return;
+    }
+  } else {
+    sendErrorResponse(res, 400, `Unknown provider: ${requestedProvider}`, 'invalid_request_error');
+    return;
+  }
+
+  const apiKey = provider === 'tavily' ? ws!.tavilyApiKey! : ws!.braveApiKey!;
+  const allowed = Array.isArray(body.allowed_domains) ? body.allowed_domains.filter((d: unknown) => typeof d === 'string') : undefined;
+  const blocked = Array.isArray(body.blocked_domains) ? body.blocked_domains.filter((d: unknown) => typeof d === 'string') : undefined;
+  const sessionId = typeof req.headers['x-woicrew-session-id'] === 'string' && req.headers['x-woicrew-session-id']
+    ? req.headers['x-woicrew-session-id'] : null;
+
+  try {
+    const hits = provider === 'tavily'
+      ? await searchTavily(query, apiKey, allowed, blocked)
+      : await searchBrave(query, apiKey, allowed, blocked);
+    appendUsageLog(username, provider, startTime, 0, 0, {
+      app: 'woicrew',
+      username,
+      kind: 'websearch',
+      input_content: query,
+      status: 200,
+      session_id: sessionId,
+      routing_key: '__default__',
+    });
+    sendJSONResponse(res, 200, { provider, results: hits });
+  } catch (err: any) {
+    const msg = `Web search failed: ${err?.message ?? 'unknown'}`;
+    appendUsageLog(username, provider, startTime, 0, 0, {
+      app: 'woicrew',
+      username,
+      kind: 'websearch',
+      input_content: query,
+      status: 502,
+      session_id: sessionId,
+      routing_key: '__default__',
+      error: msg,
+    });
+    sendErrorResponse(res, 502, msg, 'api_error');
+  }
+}
+
 // ─── Server factory ───
 
 export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
@@ -1484,6 +1584,11 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
 
       if (method === 'POST' && pathname === '/v1/messages') {
         await handleRequest(req, res, ctx);
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/v1/websearch') {
+        await handleWebSearchRequest(req, res, ctx);
         return;
       }
 
