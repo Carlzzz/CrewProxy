@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - 三个仓库独立提交，禁止 push；每个 task 结束单独 commit。
-- 三仓库当前都在 `main` 分支（用户规范禁 master；main 视为默认分支，按「每个 task 自动 commit、禁止自动 push」执行）。
+- **三仓库任何更改必须先建 feature 分支 `feat/websearch-key-centralization`，不得直接在 main 分支修改/commit**（用户明确要求；此前已落到 main 的历史文档 commit 不回退）。
 - commit message 用 `feat(websearch): <中文简述>` 或 `fix(websearch): <中文简述>`。
 - proxy 用 `node:test` + `assert/strict`；test 文件在 `test/*.test.ts`，跑 `npm test`。
 - client 用 zod schema 校验 settings；桌面端测试用 vitest。
@@ -24,6 +24,8 @@
 ---
 
 ## 阶段一：proxy（核心，先行）
+
+> **建分支**（若尚未建）：`cd C:/Users/songchao/Bruno/Ambicrew/proxy && git checkout -b feat/websearch-key-centralization`
 
 ### Task 1: 配置支持 webSearch
 
@@ -617,6 +619,8 @@ git commit -m "feat(websearch): 新增 /v1/websearch 端点"
 
 ## 阶段二：client
 
+> **建分支**（若尚未建）：`cd C:/Users/songchao/Bruno/Ambicrew/client && git checkout -b feat/websearch-key-centralization`
+
 ### Task 5: settings 删除 KEY 字段
 
 **Files:**
@@ -868,6 +872,8 @@ git commit -m "feat(websearch): 桌面端删除 KEY 输入框"
 ---
 
 ## 阶段三：server
+
+> **建分支**（若尚未建）：`cd C:/Users/songchao/Bruno/Ambicrew/server && git checkout -b feat/websearch-key-centralization`
 
 ### Task 9: llm 报表追加排除过滤
 
