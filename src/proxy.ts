@@ -1408,6 +1408,10 @@ async function handleWebSearchRequest(
     sendErrorResponse(res, 400, 'Invalid JSON in request body', 'invalid_request_error');
     return;
   }
+  if (body === null || typeof body !== 'object') {
+    sendErrorResponse(res, 400, 'Invalid JSON body', 'invalid_request_error');
+    return;
+  }
   const query = typeof body.query === 'string' ? body.query.trim() : '';
   if (!query) {
     sendErrorResponse(res, 400, 'Missing or invalid "query" in request body', 'invalid_request_error');
@@ -1457,8 +1461,8 @@ async function handleWebSearchRequest(
 
   try {
     const hits = provider === 'tavily'
-      ? await searchTavily(query, apiKey, allowed, blocked)
-      : await searchBrave(query, apiKey, allowed, blocked);
+      ? await searchTavily(query, apiKey, allowed, blocked, AbortSignal.timeout(15000))
+      : await searchBrave(query, apiKey, allowed, blocked, AbortSignal.timeout(15000));
     appendUsageLog(username, provider, startTime, 0, 0, {
       app: 'woicrew',
       username,

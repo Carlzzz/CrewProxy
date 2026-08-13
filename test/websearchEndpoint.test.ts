@@ -61,3 +61,18 @@ test('websearch endpoint requires query', async () => {
     close();
   }
 });
+
+test('websearch endpoint rejects null body with 400', async () => {
+  const ctx: ProxyRuntimeContext = { upstreamsByIdMap: new Map(), defaultUpstream: undefined, modelRoutesMap: new Map(), webSearch: { tavilyApiKey: 'tvly-x' } };
+  const { baseUrl, close } = await startServer(ctx);
+  try {
+    const resp = await fetch(`${baseUrl}/v1/websearch`, {
+      method: 'POST',
+      headers: { 'x-api-key': 'any', 'Content-Type': 'application/json' },
+      body: 'null',
+    });
+    assert.equal(resp.status, 400);
+  } finally {
+    close();
+  }
+});
