@@ -1,67 +1,58 @@
 ﻿import { logger } from './logger';
+import type { ProviderContextWindowsConfig } from './config';
 
 // 鈹€鈹€鈹€ Model context window registry 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-interface ModelContextSpec {
-  pattern: RegExp;
-  contextWindow: number;
-  maxOutputTokens: number;
-}
+export const DEFAULT_CONTEXT_WINDOW = 200_000;
+export const DEFAULT_MAX_OUTPUT = 4_096;
 
-const MODEL_CONTEXT_SPECS: ModelContextSpec[] = [
-  { pattern: /^gpt-4\.1/i,        contextWindow: 1_048_576, maxOutputTokens: 32_768 },
-  { pattern: /^gpt-4o/i,          contextWindow: 128_000,   maxOutputTokens: 32_768 },
-  { pattern: /^gpt-4-turbo/i,     contextWindow: 128_000,   maxOutputTokens: 32_768 },
-  { pattern: /^gpt-5\.6/i,        contextWindow: 272_000,   maxOutputTokens: 32_768 },
-  { pattern: /^gpt-5/i,           contextWindow: 1_048_576, maxOutputTokens: 32_768 },
-  { pattern: /^o[134]/i,          contextWindow: 200_000,   maxOutputTokens: 32_768 },
-  { pattern: /^gemini-2/i,        contextWindow: 1_048_576, maxOutputTokens: 32_768 },
-  { pattern: /^gemini-1\.5/i,     contextWindow: 1_048_576, maxOutputTokens: 32_768 },
-  { pattern: /^deepseek-v4/i,     contextWindow: 1_000_000, maxOutputTokens: 200_000 },
-  { pattern: /^deepseek/i,        contextWindow: 64_000,    maxOutputTokens: 200_000 },
-  { pattern: /^kimi/i,            contextWindow: 262_144,   maxOutputTokens: 32_768 },
-  { pattern: /^qwen3\.5/i,        contextWindow: 262_144,   maxOutputTokens: 32_768 },
-  { pattern: /^qwen/i,            contextWindow: 131_072,   maxOutputTokens: 32_768 },
-  { pattern: /^doubao-seed[-.]?2\.?1/i, contextWindow: 200_000, maxOutputTokens: 32_768 },
-  { pattern: /^doubao-seed/i,     contextWindow: 200_000,   maxOutputTokens: 32_768 },
-  { pattern: /^doubao/i,          contextWindow: 128_000,   maxOutputTokens: 32_768 },
-  { pattern: /^minimax-m3/i,      contextWindow: 1_048_576, maxOutputTokens: 32_768 },
-  { pattern: /^minimax/i,         contextWindow: 245_760,   maxOutputTokens: 32_768 },
-  { pattern: /^claude-opus-4-8/i, contextWindow: 1_000_000, maxOutputTokens: 32_768 },
-  { pattern: /^claude/i,          contextWindow: 200_000,   maxOutputTokens: 32_768 },
-  { pattern: /^glm-5\.2/i,        contextWindow: 1_000_000, maxOutputTokens: 32_768 },
-  { pattern: /^glm/i,             contextWindow: 128_000,   maxOutputTokens: 32_768 },
-  { pattern: /^yi-/i,             contextWindow: 200_000,   maxOutputTokens: 32_768 },
-];
-
-const DEFAULT_CONTEXT_WINDOW = 64_000;
-const DEFAULT_MAX_OUTPUT = 4_096;
-
-let envOverrides: Record<string, number> | null = null;
 function loadEnvOverrides(): Record<string, number> {
-  if (envOverrides !== null) return envOverrides;
-  envOverrides = {};
   const raw = process.env.WOICLAW_CONTEXT_OVERRIDES;
-  if (raw) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed === 'object') envOverrides = parsed;
-    } catch { /* ignore bad JSON */ }
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, number>) : {};
+  } catch {
+    return {};
   }
-  return envOverrides!;
 }
 
-export function getModelContextWindow(modelId: string): { contextWindow: number; maxOutputTokens: number } {
-  const overrides = loadEnvOverrides();
-  if (overrides[modelId]) {
-    return { contextWindow: overrides[modelId], maxOutputTokens: DEFAULT_MAX_OUTPUT };
-  }
-  for (const spec of MODEL_CONTEXT_SPECS) {
-    if (spec.pattern.test(modelId)) {
-      return { contextWindow: spec.contextWindow, maxOutputTokens: spec.maxOutputTokens };
+export function parseWindowToken(value: string | number): number {
+  if (typeof value === 'number') {
+    if (!Number.isInteger(value) || value <= 0) {
+      throw new Error(`invalid context window: ${value}`);
     }
+    return value;
   }
-  return { contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutputTokens: DEFAULT_MAX_OUTPUT };
+  const m = /^(\d+(?:\.\d+)?)\s*(k|m)$/i.exec(value.trim());
+  if (!m) {
+    throw new Error(`invalid context window token: "${value}" (expected e.g. "128k" or "1m")`);
+  }
+  const n = parseFloat(m[1]!);
+  const unit = m[2]!.toLowerCase();
+  return unit === 'm' ? Math.round(n * 1_000_000) : Math.round(n * 1_000);
+}
+
+export function getModelContextWindow(
+  provider: string | undefined,
+  modelId: string,
+  providerContextWindows?: ProviderContextWindowsConfig,
+): { contextWindow: number; maxOutputTokens: number } {
+  const overrides = loadEnvOverrides();
+  const modelOverride = overrides[modelId];
+
+  const providerSpec = provider
+    ? providerContextWindows?.overrides?.[provider] ?? providerContextWindows?.default
+    : providerContextWindows?.default;
+
+  const contextWindow =
+    modelOverride ??
+    (providerSpec ? parseWindowToken(providerSpec.contextWindow) : undefined) ??
+    DEFAULT_CONTEXT_WINDOW;
+
+  const maxOutputTokens = providerSpec?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT;
+
+  return { contextWindow, maxOutputTokens };
 }
 
 // 鈹€鈹€鈹€ Token estimation (Anthropic format) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
@@ -149,8 +140,13 @@ export function estimateRequestTokens(body: any): number {
 
 // 鈹€鈹€鈹€ Budget calculation 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
-export function computeInputBudget(modelId: string, requestedMaxOutput?: number): number {
-  const spec = getModelContextWindow(modelId);
+export function computeInputBudget(
+  provider: string | undefined,
+  modelId: string,
+  requestedMaxOutput?: number,
+  providerContextWindows?: ProviderContextWindowsConfig,
+): number {
+  const spec = getModelContextWindow(provider, modelId, providerContextWindows);
   const maxOutput = requestedMaxOutput || spec.maxOutputTokens;
   const budget = Math.floor((spec.contextWindow - maxOutput) * 0.85);
   return Math.max(budget, 1024);

@@ -1,6 +1,7 @@
 import * as http from 'http';
 import { logger } from './logger';
 import { ProxyRuntimeContext, UpstreamConfig, ResolvedUpstream, resolveUpstreamFromModel } from './config';
+import type { ProviderContextWindowsConfig } from './config';
 import { CodePlanPoolManager, CODE_PLAN_COOLDOWN_MS, CODE_PLAN_SHORT_COOLDOWN_MS } from './codePlanPool';
 import { classify429, parseQuotaResetEpochMs } from './codePlanQuota';
 import { buildAnthropicMessagesURL } from './formatTransform';
@@ -21,10 +22,12 @@ export function resolveModelContextWindow(
   upstreamsByIdMap: Map<string, any>,
   defaultUpstream: any,
   modelRoutesMap?: Map<string, any>,
+  providerContextWindows?: ProviderContextWindowsConfig,
 ): number {
   const r = resolveUpstreamFromModel(modelId, upstreamsByIdMap, defaultUpstream, modelRoutesMap);
   const realModel = r?.modelId ?? modelId;
-  return getModelContextWindow(realModel).contextWindow;
+  const provider = r?.upstream?.provider;
+  return getModelContextWindow(provider, realModel, providerContextWindows).contextWindow;
 }
 
 /** Tokens removed by a context trim = estimate before − estimate after,
@@ -847,7 +850,7 @@ async function handleRequest(
 
   // Auto-boost max_tokens to model maximum if not set or too low
   {
-    const { maxOutputTokens } = getModelContextWindow(anthropicReq.model);
+    const { maxOutputTokens } = getModelContextWindow(upstream.provider, anthropicReq.model, ctx.providerContextWindows);
     if (maxOutputTokens > 0) {
       const currentMax = anthropicReq.max_tokens ?? 0;
       if (!currentMax || currentMax < maxOutputTokens) {
@@ -878,7 +881,7 @@ async function handleRequest(
   {
     const effectiveModelForBudget = modelId || upstream.model;
     const requestedMaxOutput = upstreamRequestBody.max_tokens;
-    const inputBudget = computeInputBudget(effectiveModelForBudget, requestedMaxOutput);
+    const inputBudget = computeInputBudget(upstream.provider, effectiveModelForBudget, requestedMaxOutput, ctx.providerContextWindows);
     const estimated = estimateRequestTokens(upstreamRequestBody);
 
     if (estimated > inputBudget) {
@@ -1536,7 +1539,7 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
         const items: Array<{ model_id: string; model_alias: string; context_window: number }> = [];
         const seen = new Set<string>();
         const windowFor = (m: string) =>
-          resolveModelContextWindow(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
+          resolveModelContextWindow(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap, ctx.providerContextWindows);
 
         for (const [modelName] of ctx.modelRoutesMap) {
           if (seen.has(modelName)) continue;

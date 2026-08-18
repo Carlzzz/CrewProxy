@@ -75,6 +75,12 @@
     "claude-opus-4-7": { "upstream": "glm", "model": "glm-5.2" },
     "claude-haiku-4-5-20251001": { "upstream": "minimax", "model": "MiniMax-M3" }
   },
+  "providerContextWindows": {
+    "default": { "contextWindow": "1m", "maxOutputTokens": 32768 },
+    "overrides": {
+      "ark": { "contextWindow": "200k" }
+    }
+  },
   "hiddenModels": [
     "opus",
     "sonnet",

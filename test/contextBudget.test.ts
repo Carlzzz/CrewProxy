@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { stripOrphanedToolResults, trimToFitBudget, aggressiveTrimForRetry } from '../src/contextBudget';
+import {
+  stripOrphanedToolResults,
+  trimToFitBudget,
+  aggressiveTrimForRetry,
+  parseWindowToken,
+  getModelContextWindow,
+  computeInputBudget,
+  DEFAULT_CONTEXT_WINDOW,
+} from '../src/contextBudget';
+import type { ProviderContextWindowsConfig } from '../src/config';
 
 test('strips a mixed orphan tool_result block but keeps sibling text', () => {
   const messages = [
@@ -98,4 +107,47 @@ test('aggressiveTrimForRetry leaves no orphan tool_results', () => {
   const body = makeOrphanProneBody();
   const out = aggressiveTrimForRetry(body, 0);
   assertNoOrphans(out);
+});
+
+// ─── Provider-level context window (Task 2) ───
+
+test('parseWindowToken parses unit suffixes and numbers', () => {
+  assert.equal(parseWindowToken('1m'), 1_000_000);
+  assert.equal(parseWindowToken('200k'), 200_000);
+  assert.equal(parseWindowToken('128k'), 128_000);
+  assert.equal(parseWindowToken('1.5m'), 1_500_000);
+  assert.equal(parseWindowToken(400_000), 400_000);
+});
+
+test('parseWindowToken throws on invalid token', () => {
+  assert.throws(() => parseWindowToken('abc'), /invalid context window token/);
+});
+
+const cfg: ProviderContextWindowsConfig = {
+  default: { contextWindow: '1m', maxOutputTokens: 32768 },
+  overrides: { ark: { contextWindow: '200k' } },
+};
+
+test('getModelContextWindow: provider override wins over default', () => {
+  assert.equal(getModelContextWindow('ark', 'doubao-seed-2.1', cfg).contextWindow, 200_000);
+  assert.equal(getModelContextWindow('glm', 'glm-5.3', cfg).contextWindow, 1_000_000);
+});
+
+test('getModelContextWindow: model override wins over provider, keeps provider maxOutput', () => {
+  process.env.WOICLAW_CONTEXT_OVERRIDES = JSON.stringify({ 'glm-4.5': 128_000 });
+  const r = getModelContextWindow('glm', 'glm-4.5', cfg);
+  assert.equal(r.contextWindow, 128_000);
+  assert.equal(r.maxOutputTokens, 32768);
+  delete process.env.WOICLAW_CONTEXT_OVERRIDES;
+});
+
+test('getModelContextWindow: falls back to 200k when no config and no override', () => {
+  const r = getModelContextWindow(undefined, 'unknown-model', undefined);
+  assert.equal(r.contextWindow, DEFAULT_CONTEXT_WINDOW);
+  assert.equal(DEFAULT_CONTEXT_WINDOW, 200_000);
+});
+
+test('computeInputBudget uses provider-aware window', () => {
+  const budget = computeInputBudget('glm', 'glm-5.3', undefined, cfg);
+  assert.equal(budget, Math.floor((1_000_000 - 32768) * 0.85));
 });
