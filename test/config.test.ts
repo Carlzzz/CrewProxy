@@ -64,3 +64,20 @@ test('parseProxyConfigObject parses bochaApiKey', () => {
   const cfg = parseProxyConfigObject({ webSearch: { bochaApiKey: 'sk-bocha' } });
   assert.deepEqual(cfg.webSearch, { bochaApiKey: 'sk-bocha' });
 });
+
+test('parseProxyConfigObject parses providerContextWindows with default and overrides', () => {
+  const parsed = parseProxyConfigObject({
+    providerContextWindows: {
+      default: { contextWindow: '1m', maxOutputTokens: 32768 },
+      overrides: { ark: { contextWindow: '200k' } },
+    },
+  });
+  assert.deepEqual(parsed.providerContextWindows, {
+    default: { contextWindow: '1m', maxOutputTokens: 32768 },
+    overrides: { ark: { contextWindow: '200k' } },
+  });
+});
+
+test('parseProxyConfigObject throws when providerContextWindows.default is missing', () => {
+  assert.throws(() => parseProxyConfigObject({ providerContextWindows: {} }), /default is required/);
+});

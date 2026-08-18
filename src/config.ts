@@ -34,6 +34,16 @@ export interface WebSearchConfig {
   bochaApiKey?: string;
 }
 
+export interface ProviderContextWindowSpec {
+  contextWindow: string | number;
+  maxOutputTokens?: number;
+}
+
+export interface ProviderContextWindowsConfig {
+  default: ProviderContextWindowSpec;
+  overrides?: Record<string, ProviderContextWindowSpec>;
+}
+
 export interface ModelRouteTarget {
   upstream: string;
   model?: string;
@@ -45,6 +55,7 @@ export interface ProxyConfig {
   defaultUpstream?: UpstreamConfig;
   upstreamsById?: Record<string, UpstreamConfig>;
   modelRoutes?: Record<string, string | ModelRouteTarget>;
+  providerContextWindows?: ProviderContextWindowsConfig;
   /** Model keys that route normally but are hidden from the GET /models
    * listing. Used for internal tier aliases (opus/sonnet/haiku) that Claude
    * Code calls under the hood — they must resolve, but should not appear in
@@ -59,6 +70,7 @@ export interface ProxyRuntimeContext {
   modelRoutesMap: Map<string, ModelRouteTarget>;
   /** Model keys hidden from GET /models but still routable (internal aliases). */
   hiddenModels?: Set<string>;
+  providerContextWindows?: ProviderContextWindowsConfig;
   codePlanPool?: CodePlanPoolManager;
   metrics?: MetricsCollector;
   quotaFetcher?: QuotaFetcher;
@@ -153,6 +165,50 @@ function normalizeWebSearch(v: unknown): WebSearchConfig {
   if (typeof o.braveApiKey === 'string' && o.braveApiKey) out.braveApiKey = o.braveApiKey;
   if (typeof o.bochaApiKey === 'string' && o.bochaApiKey) out.bochaApiKey = o.bochaApiKey;
   return out;
+}
+
+function normalizeProviderContextWindowSpec(v: unknown): ProviderContextWindowSpec {
+  if (v === null || typeof v !== 'object') {
+    throw new Error('providerContextWindows spec must be an object');
+  }
+  const o = v as Record<string, unknown>;
+  if (o.contextWindow === undefined || o.contextWindow === null) {
+    throw new Error('providerContextWindows spec.contextWindow is required');
+  }
+  if (typeof o.contextWindow !== 'string' && typeof o.contextWindow !== 'number') {
+    throw new Error('providerContextWindows spec.contextWindow must be a string or number');
+  }
+  const spec: ProviderContextWindowSpec = { contextWindow: o.contextWindow as string | number };
+  if (o.maxOutputTokens !== undefined && o.maxOutputTokens !== null) {
+    if (typeof o.maxOutputTokens !== 'number') {
+      throw new Error('providerContextWindows spec.maxOutputTokens must be a number');
+    }
+    spec.maxOutputTokens = o.maxOutputTokens;
+  }
+  return spec;
+}
+
+function normalizeProviderContextWindows(v: unknown): ProviderContextWindowsConfig {
+  if (v === null || typeof v !== 'object') {
+    throw new Error('providerContextWindows must be an object');
+  }
+  const o = v as Record<string, unknown>;
+  if (o.default === undefined || o.default === null || typeof o.default !== 'object') {
+    throw new Error('providerContextWindows.default is required');
+  }
+  const config: ProviderContextWindowsConfig = {
+    default: normalizeProviderContextWindowSpec(o.default),
+  };
+  if (o.overrides !== undefined) {
+    if (o.overrides === null || typeof o.overrides !== 'object') {
+      throw new Error('providerContextWindows.overrides must be an object');
+    }
+    config.overrides = {};
+    for (const [provider, spec] of Object.entries(o.overrides as Record<string, unknown>)) {
+      config.overrides[provider] = normalizeProviderContextWindowSpec(spec);
+    }
+  }
+  return config;
 }
 
 function readConfigFile(filePath: string): ProxyConfig {
@@ -278,6 +334,9 @@ export function parseProxyConfigObject(raw: unknown): ProxyConfig {
   if (r.webSearch !== undefined) {
     out.webSearch = normalizeWebSearch(r.webSearch);
   }
+  if (r.providerContextWindows !== undefined) {
+    out.providerContextWindows = normalizeProviderContextWindows(r.providerContextWindows);
+  }
   return out;
 }
 
@@ -308,6 +367,7 @@ export function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext 
     modelRoutesMap,
     hiddenModels,
     webSearch: config.webSearch,
+    providerContextWindows: config.providerContextWindows,
   };
 }
 
