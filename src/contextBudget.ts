@@ -50,7 +50,10 @@ export function getModelContextWindow(
     (providerSpec ? parseWindowToken(providerSpec.contextWindow) : undefined) ??
     DEFAULT_CONTEXT_WINDOW;
 
-  const maxOutputTokens = providerSpec?.maxOutputTokens ?? DEFAULT_MAX_OUTPUT;
+  const maxOutputTokens =
+    providerSpec?.maxOutputTokens ??
+    providerContextWindows?.default?.maxOutputTokens ??
+    DEFAULT_MAX_OUTPUT;
 
   return { contextWindow, maxOutputTokens };
 }

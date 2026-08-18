@@ -151,3 +151,9 @@ test('computeInputBudget uses provider-aware window', () => {
   const budget = computeInputBudget('glm', 'glm-5.3', undefined, cfg);
   assert.equal(budget, Math.floor((1_000_000 - 32768) * 0.85));
 });
+
+test('getModelContextWindow: override without maxOutputTokens inherits default maxOutput', () => {
+  const r = getModelContextWindow('ark', 'doubao-seed-2.1', cfg);
+  assert.equal(r.contextWindow, 200_000);
+  assert.equal(r.maxOutputTokens, 32768);
+});
