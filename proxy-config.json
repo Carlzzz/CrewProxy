@@ -80,7 +80,7 @@
     "overrides": {
       "ark": { "contextWindow": "200k" },
       "gpt": { "contextWindow": "272k" },
-      "deepseek": { "contextWindow": "1m", "maxOutputTokens": 200000 }
+      "deepseek": { "contextWindow": "1m", "maxOutputTokens": 384000 }
     }
   },
   "hiddenModels": [
