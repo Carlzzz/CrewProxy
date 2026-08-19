@@ -61,6 +61,7 @@
   "modelRoutes": {
     "doubao-seed-2.1-turbo": "ark",
     "glm-5.2": "glm",
+    "glm-5.3": "glm",
     "MiniMax-M3": "minimax",
     "deepseek-v4-pro": "deepseek",
     "deepseek-v4-flash": "deepseek",
