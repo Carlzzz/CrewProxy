@@ -141,7 +141,7 @@ context.ts        getContextWindowForModel 读 env → 兜底 200k
 
 ## 兼容性
 
-- 旧 proxy（无 `providerContextWindows` 配置）+ 新 client：`proxyModelContextWindows` 为空 → env 无窗口 → client 兜底 200k，行为可接受。
+- 旧 proxy（仍用 `MODEL_CONTEXT_SPECS` 旧表）+ 新 client：旧 proxy 的 `/models` 会广告旧表的 `context_window`（如 glm-5.3 命中 `/^glm/` → 128k），新 client 回填旧表值，故显示旧表值而非 200k。client 的 200k 兜底只在 proxy 完全不返回 `context_window` 字段（real-context-window-backflow 之前的更老 proxy）时才生效。
 - 新 proxy + 旧 client：旧 client 仍读 env，忽略 provider 级结构，行为不变。
 - 两端可独立部署，无部署顺序要求。
 
