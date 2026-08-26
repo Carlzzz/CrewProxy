@@ -1023,8 +1023,16 @@ async function handleRequest(
       }
     }
 
-    // Update model in request body for this credential
-    upstreamRequestBody.model = effectiveModel;
+    // Update model in request body for this credential.
+    // outboundModelMap 用于旁路重命名（如联通云 DeepSeek-V4-Pro 大小写差异）。
+    // 只影响发给上游的 body，不影响 modelId、权限、统计、日志展示。
+    //
+    // 位置选择：credential 循环内、fetch 之前。此时 effectiveModel 已经过所有
+    // 重写（普通路径 / codePlan pick / ordinaryFallbackModelMap 等）。未来
+    // 任何 provider 若启用 codePlan 或其他重写分支，无需额外改动，出站前的
+    // 最终名字都会经过这里的映射。
+    const outboundName = upstream.outboundModelMap?.[effectiveModel] ?? effectiveModel;
+    upstreamRequestBody.model = outboundName;
 
     // ── Build headers for this credential ──
     const upstreamHeaders: Record<string, string> = {

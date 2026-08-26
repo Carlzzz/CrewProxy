@@ -26,6 +26,10 @@ export interface UpstreamConfig {
   // from the data-plane inference apiKey. Only meaningful for volces.com upstreams.
   accessKeyId?: string;
   secretAccessKey?: string;
+  /** 客户端认识的模型名 → 上游认识的模型名。仅在出站 body.model 组装前生效，
+   *  不影响 modelId、权限、统计、UI。用于旁路重命名，例如联通云 deepseek 端点
+   *  要求大写模型名（DeepSeek-V4-Pro）而客户端与权限系统全链路小写。 */
+  outboundModelMap?: Record<string, string>;
 }
 
 export interface WebSearchConfig {
@@ -152,6 +156,12 @@ export function normalizeUpstream(u: unknown): UpstreamConfig {
   }
   if (typeof o.secretAccessKey === 'string' && o.secretAccessKey) {
     out.secretAccessKey = o.secretAccessKey;
+  }
+  if (o.outboundModelMap !== undefined && o.outboundModelMap !== null && typeof o.outboundModelMap === 'object') {
+    out.outboundModelMap = Object.fromEntries(
+      Object.entries(o.outboundModelMap as Record<string, unknown>)
+        .map(([k, v]) => [k, String(v)])
+    );
   }
   return out;
 }
