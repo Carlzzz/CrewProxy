@@ -11,3 +11,10 @@ Thumbs.db
 *.swp
 
 # Local proxy config may contain real API keys — never commit
+# proxy-config.example.json 是脱敏样板，显式保留在版本中
+proxy-config*.json
+proxy-config*.json.bak
+!proxy-config.example.json
+
+# Typora auto-generated hook logs
+Typora_Hook_Log.txt
