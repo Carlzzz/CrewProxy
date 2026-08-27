@@ -1,7 +1,7 @@
 import * as http from 'http';
 import { logger } from './logger';
-import { ProxyRuntimeContext, UpstreamConfig, ResolvedUpstream, resolveUpstreamFromModel } from './config';
-import type { ProviderContextWindowsConfig } from './config';
+import { ProxyRuntimeContext, UpstreamConfig, ResolvedUpstream, resolveUpstreamFromModel, isModelAllowed } from './config';
+import type { ProviderContextWindowsConfig, PermissionRules } from './config';
 import { CodePlanPoolManager, CODE_PLAN_COOLDOWN_MS, CODE_PLAN_SHORT_COOLDOWN_MS } from './codePlanPool';
 import { classify429, parseQuotaResetEpochMs } from './codePlanQuota';
 import { buildAnthropicMessagesURL } from './formatTransform';
@@ -266,7 +266,7 @@ function consumeBody(req: http.IncomingMessage): void {
 const AUTH_CACHE_MAX_SIZE = 1000;
 
 interface CacheEntry {
-  userInfo: { name: string; allowedModels: string[] | null };
+  userInfo: { name: string; permissionRules: PermissionRules | null };
   expiresAt: number;
 }
 const authCache = new Map<string, CacheEntry>();
@@ -304,9 +304,9 @@ function extractClientApiKey(req: http.IncomingMessage): string | null {
   return null;
 }
 
-async function authenticateRequest(token: string): Promise<{ name: string; allowedModels: string[] | null } | null> {
+async function authenticateRequest(token: string): Promise<{ name: string; permissionRules: PermissionRules | null } | null> {
   if (isAuthBypassed()) {
-    return { name: 'bypass', allowedModels: null };
+    return { name: 'bypass', permissionRules: null };
   }
 
   const cacheKey = token;
@@ -322,7 +322,7 @@ async function authenticateRequest(token: string): Promise<{ name: string; allow
 
   const authHost = getAuthHost();
   const proxyKey = getProxyApiKey();
-  let userInfo: { name: string; allowedModels: string[] | null } | null = null;
+  let userInfo: { name: string; permissionRules: PermissionRules | null } | null = null;
 
   if (authHost) {
     logger.verbose('[auth] Trying introspect first (authHost configured)');
@@ -337,7 +337,7 @@ async function authenticateRequest(token: string): Promise<{ name: string; allow
 
   if (!userInfo && proxyKey) {
     if (token === proxyKey) {
-      userInfo = { name: 'local', allowedModels: null };
+      userInfo = { name: 'local', permissionRules: null };
     }
   }
 
@@ -355,7 +355,7 @@ async function authenticateRequest(token: string): Promise<{ name: string; allow
   return null;
 }
 
-async function fetchUserInfo(token: string): Promise<{ name: string; allowedModels: string[] | null } | null> {
+async function fetchUserInfo(token: string): Promise<{ name: string; permissionRules: PermissionRules | null } | null> {
   const authHost = getAuthHost();
   if (!authHost) {
     logger.error('Auth host not configured (WOICLAW_AUTH_HOST)');
@@ -415,13 +415,21 @@ async function fetchUserInfo(token: string): Promise<{ name: string; allowedMode
       return null;
     }
 
-    const allowedModels = getNestedField(body, 'data.allowed_models');
-    let parsedAllowedModels: string[] | null = null;
-    if (Array.isArray(allowedModels)) {
-      parsedAllowedModels = allowedModels.map((m: any) => String(m).trim());
+    // server 端 (CrewCentral) introspect 返回 data.permission_rules: PermissionRules | null。
+    // null 表示无限制 (super_admin 或未配置权限记录); 对象表示按 rules 判断。
+    // 只做形状校验, 不做深度合法性判断 — 缺失字段在 isModelAllowed 里按空数组处理。
+    const rawRules = getNestedField(body, 'data.permission_rules');
+    let permissionRules: PermissionRules | null = null;
+    if (rawRules && typeof rawRules === 'object' && !Array.isArray(rawRules)) {
+      const asAny = rawRules as any;
+      permissionRules = {
+        providers: Array.isArray(asAny.providers) ? asAny.providers.map((x: any) => String(x).trim()).filter(Boolean) : [],
+        extra_models: Array.isArray(asAny.extra_models) ? asAny.extra_models.map((x: any) => String(x).trim()).filter(Boolean) : [],
+        denied_models: Array.isArray(asAny.denied_models) ? asAny.denied_models.map((x: any) => String(x).trim()).filter(Boolean) : [],
+      };
     }
 
-    return { name: name.trim(), allowedModels: parsedAllowedModels };
+    return { name: name.trim(), permissionRules };
   } catch (err) {
     logger.error('Auth error:', err);
     return null;
@@ -808,20 +816,17 @@ async function handleRequest(
   }
 
   const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
-  let userInfo: { name: string; allowedModels?: string[] | null };
+  let userInfo: { name: string; permissionRules: PermissionRules | null };
   if (typeof headerUser === 'string' && headerUser.trim()) {
-    userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: authResult.allowedModels };
+    userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules };
   } else {
     userInfo = authResult;
   }
   const clientId = userInfo.name;
 
   // ─── Upstream resolution ───
-  // Resolve BEFORE the permission check so aliases (opus/sonnet/haiku) are
-  // rewritten to their real model id first. Authorization is then enforced on
-  // the real model, not the alias — otherwise granting an alias would bypass a
-  // restriction on the model it maps to (e.g. "opus" allowed but
-  // "claude-opus-4-8" not). See resolveUpstreamFromModel in config.ts.
+  // Resolve BEFORE the permission check so aliases (opus/sonnet/haiku)展开到
+  // 真实 upstream, 权限判断能拿到路由后的 upstream.provider。
   const resolved = resolveUpstreamFromModel(model, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
   if (!resolved) {
     sendErrorResponse(res, 403, `No upstream configured for model: ${model}`, 'permission_error');
@@ -830,14 +835,12 @@ async function handleRequest(
   const { upstream, modelId, upstreamRouteId } = resolved;
 
   // ─── Model Permissions Check ───
-  // Enforce on the resolved real model id (modelId), which for an alias route
-  // is the rewritten target and for a direct request is the requested model.
-  if (userInfo.allowedModels !== undefined && userInfo.allowedModels !== null) {
-    if (!userInfo.allowedModels.includes(modelId)) {
-      const label = modelId === model ? model : `${model} (${modelId})`;
-      sendErrorResponse(res, 403, `Model ${label} is not allowed for your account.`, 'permission_error');
-      return;
-    }
+  // rules 用展开后的真实 modelId + upstream.provider 判断。alias (opus/sonnet/haiku)
+  // 是路由语法糖, 权限跟随展开后的真实模型 — 前端只暴露真实模型给管理员, 心智一致。
+  if (!isModelAllowed(modelId, upstream.provider, userInfo.permissionRules)) {
+    const label = modelId === model ? model : `${model} (${modelId})`;
+    sendErrorResponse(res, 403, `Model ${label} is not allowed for your account.`, 'permission_error');
+    return;
   }
 
   const codePlanPoolKey = upstreamRouteId || '__default__';
@@ -1537,17 +1540,21 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
         }
 
         const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
-        let userInfo: { name: string; allowedModels: string[] | null };
+        let userInfo: { name: string; permissionRules: PermissionRules | null };
         if (typeof headerUser === 'string' && headerUser.trim()) {
-          userInfo = { name: decodeURIComponent(headerUser.trim()), allowedModels: authResult.allowedModels };
+          userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules };
         } else {
           userInfo = authResult;
         }
 
-        const items: Array<{ model_id: string; model_alias: string; context_window: number }> = [];
+        const items: Array<{ model_id: string; model_alias: string; context_window: number; provider?: string }> = [];
         const seen = new Set<string>();
         const windowFor = (m: string) =>
           resolveModelContextWindow(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap, ctx.providerContextWindows);
+        const providerFor = (m: string): string | undefined => {
+          const r = resolveUpstreamFromModel(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
+          return r?.upstream.provider;
+        };
 
         for (const [modelName] of ctx.modelRoutesMap) {
           if (seen.has(modelName)) continue;
@@ -1555,31 +1562,30 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           // omitted from the picker so users select real model names instead.
           if (ctx.hiddenModels?.has(modelName)) continue;
           seen.add(modelName);
-          items.push({ model_id: modelName, model_alias: modelName, context_window: windowFor(modelName) });
+          items.push({ model_id: modelName, model_alias: modelName, context_window: windowFor(modelName), provider: providerFor(modelName) });
         }
 
         for (const [upstreamId, upstream] of ctx.upstreamsByIdMap) {
           if (seen.has(upstream.model)) continue;
           seen.add(upstream.model);
-          items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model, context_window: windowFor(upstream.model) });
+          items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model, context_window: windowFor(upstream.model), provider: upstream.provider });
         }
 
         if (ctx.defaultUpstream && !seen.has(ctx.defaultUpstream.model)) {
-          items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model, context_window: windowFor(ctx.defaultUpstream.model) });
+          items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model, context_window: windowFor(ctx.defaultUpstream.model), provider: ctx.defaultUpstream.provider });
         }
 
-        let filteredItems = items;
-        if (userInfo.allowedModels !== null) {
-          // Filter by the real model each item resolves to, mirroring the
-          // permission check on /v1/messages. An alias item (model_id "opus")
-          // is kept when its resolved target (e.g. "claude-opus-4-8") is
-          // allowed, so the advertised list matches what requests will accept.
-          filteredItems = items.filter(item => {
-            const r = resolveUpstreamFromModel(item.model_id, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
-            const realModel = r?.modelId ?? item.model_id;
-            return userInfo.allowedModels!.includes(realModel);
-          });
-        }
+        // 按 rules 过滤: 用展开后的真实 modelId + upstream.provider, 跟 /v1/messages
+        // 保持同一套语义。alias item (opus 等) 命中其展开目标 (glm-5.3) 的权限时保留,
+        // rules === null 时全部放行。
+        const filteredItems = userInfo.permissionRules === null
+          ? items
+          : items.filter(item => {
+              const r = resolveUpstreamFromModel(item.model_id, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
+              const realModel = r?.modelId ?? item.model_id;
+              const provider = r?.upstream.provider ?? item.provider;
+              return isModelAllowed(realModel, provider, userInfo.permissionRules);
+            });
 
         sendJSONResponse(res, 200, { items: filteredItems });
         return;
