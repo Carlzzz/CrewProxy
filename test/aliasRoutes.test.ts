@@ -49,17 +49,18 @@ test('real model ids still route unchanged after adding aliases', () => {
   assert.strictEqual(r!.modelId, 'claude-opus-4-8');
 });
 
-// ─── Authorization runs on the INBOUND model + resolved provider ───
-// Mirrors /v1/messages: resolve upstream to get provider, then
-// isModelAllowed(model, provider, rules). Alias 命中 provider 白名单时自动放行。
+// ─── Authorization runs on the RESOLVED real model + provider ───
+// Mirrors /v1/messages: resolve upstream first, then
+// isModelAllowed(resolved.modelId, resolved.upstream.provider, rules).
+// alias 是路由语法糖, 权限跟随其展开目标, 不引入 alias 层的独立语义。
 
 import { isModelAllowed } from '../src/config';
 
-function providerOf(model: string): string | undefined {
-  return resolve(model)?.upstream.provider;
-}
 function isAllowed(model: string, rules: any): boolean {
-  return isModelAllowed(model, providerOf(model), rules);
+  const r = resolve(model);
+  const realModel = r?.modelId ?? model;
+  const provider = r?.upstream.provider;
+  return isModelAllowed(realModel, provider, rules);
 }
 
 test('null rules (super_admin / bypass) permits everything', () => {
@@ -67,20 +68,29 @@ test('null rules (super_admin / bypass) permits everything', () => {
   assert.strictEqual(isAllowed('claude-opus-4-8', null), true);
 });
 
-test('provider whitelist permits its models AND aliases routing to it', () => {
-  // glm provider 放开 → 直接命中 glm-5.3, 也命中 opus (opus 展开 upstream=glm)
+test('provider whitelist permits its models AND aliases展开到该 provider', () => {
+  // glm provider 放开 → glm-5.3 命中; opus 展开 glm-5.3 后也命中
   const rules = { providers: ['glm'], extra_models: [], denied_models: [] };
   assert.strictEqual(isAllowed('glm-5.3', rules), true);
   assert.strictEqual(isAllowed('opus', rules), true);
-  // deepseek 未放开 → sonnet (展开到 deepseek) 被拒绝
+  // deepseek 未放开 → sonnet (展开 deepseek-v4-pro) 被拒
   assert.strictEqual(isAllowed('sonnet', rules), false);
   assert.strictEqual(isAllowed('deepseek-v4-pro', rules), false);
 });
 
-test('extra_models 独立放开单个入站模型 (跨 provider 补丁)', () => {
+test('extra_models 允许具体真实模型, alias 展开命中也放行', () => {
+  // 只放 glm-5.3 到 extra, 不开 glm provider
+  const rules = { providers: [], extra_models: ['glm-5.3'], denied_models: [] };
+  assert.strictEqual(isAllowed('glm-5.3', rules), true);
+  // opus 展开 glm-5.3 → 命中 extra
+  assert.strictEqual(isAllowed('opus', rules), true);
+  // 未放 deepseek-v4-pro → sonnet 展开后被拒
+  assert.strictEqual(isAllowed('sonnet', rules), false);
+});
+
+test('extra_models 独立放开单个模型 (跨 provider 补丁)', () => {
   const rules = { providers: [], extra_models: ['claude-opus-4-8'], denied_models: [] };
   assert.strictEqual(isAllowed('claude-opus-4-8', rules), true);
-  // 未在 extra 且 provider 未开 → 拒绝
   assert.strictEqual(isAllowed('claude-sonnet-4-6', rules), false);
 });
 
@@ -90,9 +100,15 @@ test('denied_models 在 provider 全开下挖洞', () => {
   assert.strictEqual(isAllowed('gpt-5.6-sol', rules), false);
 });
 
+test('denied_models 命中 alias 的展开目标时也拒绝 alias', () => {
+  // opus 展开 glm-5.3。glm provider 放开但 glm-5.3 被 denied → opus 也被拒
+  const rules = { providers: ['glm'], extra_models: [], denied_models: ['glm-5.3'] };
+  assert.strictEqual(isAllowed('opus', rules), false);
+  assert.strictEqual(isAllowed('glm-5.3', rules), false);
+});
+
 test('优先级 deny > extra > provider', () => {
   const rules = { providers: ['glm'], extra_models: ['glm-5.3'], denied_models: ['glm-5.3'] };
-  // denied 胜出
   assert.strictEqual(isAllowed('glm-5.3', rules), false);
 });
 

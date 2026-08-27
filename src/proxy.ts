@@ -835,11 +835,11 @@ async function handleRequest(
   const { upstream, modelId, upstreamRouteId } = resolved;
 
   // ─── Model Permissions Check ───
-  // rules 用入站键 (model, 前端配置权限时勾选的名字) + 路由后 upstream.provider
-  // 判断, 跟出站 modelId 脱钩。alias (opus/sonnet/haiku) 命中 provider 白名单
-  // 时自动放行, 不需要单独把 alias 加进权限。
-  if (!isModelAllowed(model, upstream.provider, userInfo.permissionRules)) {
-    sendErrorResponse(res, 403, `Model ${model} is not allowed for your account.`, 'permission_error');
+  // rules 用展开后的真实 modelId + upstream.provider 判断。alias (opus/sonnet/haiku)
+  // 是路由语法糖, 权限跟随展开后的真实模型 — 前端只暴露真实模型给管理员, 心智一致。
+  if (!isModelAllowed(modelId, upstream.provider, userInfo.permissionRules)) {
+    const label = modelId === model ? model : `${model} (${modelId})`;
+    sendErrorResponse(res, 403, `Model ${label} is not allowed for your account.`, 'permission_error');
     return;
   }
 
@@ -1575,11 +1575,17 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model, context_window: windowFor(ctx.defaultUpstream.model), provider: ctx.defaultUpstream.provider });
         }
 
-        // 按 rules 过滤: 用 item.model_id (入站键) + item.provider (路由后 upstream.provider),
-        // 跟 /v1/messages 的权限判断保持同一套语义。rules === null 时全部放行。
+        // 按 rules 过滤: 用展开后的真实 modelId + upstream.provider, 跟 /v1/messages
+        // 保持同一套语义。alias item (opus 等) 命中其展开目标 (glm-5.3) 的权限时保留,
+        // rules === null 时全部放行。
         const filteredItems = userInfo.permissionRules === null
           ? items
-          : items.filter(item => isModelAllowed(item.model_id, item.provider, userInfo.permissionRules));
+          : items.filter(item => {
+              const r = resolveUpstreamFromModel(item.model_id, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
+              const realModel = r?.modelId ?? item.model_id;
+              const provider = r?.upstream.provider ?? item.provider;
+              return isModelAllowed(realModel, provider, userInfo.permissionRules);
+            });
 
         sendJSONResponse(res, 200, { items: filteredItems });
         return;
