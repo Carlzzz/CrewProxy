@@ -149,3 +149,16 @@ test('models listing omits hidden aliases but keeps real models', () => {
   assert.ok(listed.includes('glm-5.2'), 'real model glm-5.2 should be listed');
   assert.ok(listed.includes('claude-opus-4-8'), 'real model claude-opus-4-8 should be listed');
 });
+
+// ─── /v1/models emits provider per item (drives frontend provider grouping) ───
+
+test('resolved upstream carries provider for /v1/models item enrichment', () => {
+  const providerFor = (m: string) => resolve(m)?.upstream.provider;
+  // Real models: provider comes from the routed upstream
+  assert.strictEqual(providerFor('deepseek-v4-pro'), 'deepseek');
+  assert.strictEqual(providerFor('glm-5.2'), 'glm');
+  assert.strictEqual(providerFor('MiniMax-M3'), 'minimax');
+  // Alias routes to a different provider than its name suggests — we still
+  // want the ROUTED provider so the frontend groups aliases correctly.
+  assert.strictEqual(providerFor('opus'), 'glm');
+});

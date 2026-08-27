@@ -1544,10 +1544,14 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           userInfo = authResult;
         }
 
-        const items: Array<{ model_id: string; model_alias: string; context_window: number }> = [];
+        const items: Array<{ model_id: string; model_alias: string; context_window: number; provider?: string }> = [];
         const seen = new Set<string>();
         const windowFor = (m: string) =>
           resolveModelContextWindow(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap, ctx.providerContextWindows);
+        const providerFor = (m: string): string | undefined => {
+          const r = resolveUpstreamFromModel(m, ctx.upstreamsByIdMap, ctx.defaultUpstream, ctx.modelRoutesMap);
+          return r?.upstream.provider;
+        };
 
         for (const [modelName] of ctx.modelRoutesMap) {
           if (seen.has(modelName)) continue;
@@ -1555,17 +1559,17 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
           // omitted from the picker so users select real model names instead.
           if (ctx.hiddenModels?.has(modelName)) continue;
           seen.add(modelName);
-          items.push({ model_id: modelName, model_alias: modelName, context_window: windowFor(modelName) });
+          items.push({ model_id: modelName, model_alias: modelName, context_window: windowFor(modelName), provider: providerFor(modelName) });
         }
 
         for (const [upstreamId, upstream] of ctx.upstreamsByIdMap) {
           if (seen.has(upstream.model)) continue;
           seen.add(upstream.model);
-          items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model, context_window: windowFor(upstream.model) });
+          items.push({ model_id: `${upstreamId}|${upstream.model}`, model_alias: upstream.model, context_window: windowFor(upstream.model), provider: upstream.provider });
         }
 
         if (ctx.defaultUpstream && !seen.has(ctx.defaultUpstream.model)) {
-          items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model, context_window: windowFor(ctx.defaultUpstream.model) });
+          items.push({ model_id: ctx.defaultUpstream.model, model_alias: ctx.defaultUpstream.model, context_window: windowFor(ctx.defaultUpstream.model), provider: ctx.defaultUpstream.provider });
         }
 
         let filteredItems = items;
