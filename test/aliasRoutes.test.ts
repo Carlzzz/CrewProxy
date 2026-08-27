@@ -49,42 +49,64 @@ test('real model ids still route unchanged after adding aliases', () => {
   assert.strictEqual(r!.modelId, 'claude-opus-4-8');
 });
 
-// ─── Authorization is enforced on the RESOLVED real model, not the alias ───
-// These mirror the permission logic in proxy.ts: resolve first, then check
-// allowedModels against resolved.modelId. Granting an alias must NOT bypass a
-// restriction on the real model it maps to.
+// ─── Authorization runs on the INBOUND model + resolved provider ───
+// Mirrors /v1/messages: resolve upstream to get provider, then
+// isModelAllowed(model, provider, rules). Alias 命中 provider 白名单时自动放行。
 
-function isAllowed(model: string, allowedModels: string[] | null): boolean {
-  if (allowedModels === null) return true;
-  const r = resolve(model);
-  const realModel = r?.modelId ?? model;
-  return allowedModels.includes(realModel);
+import { isModelAllowed } from '../src/config';
+
+function providerOf(model: string): string | undefined {
+  return resolve(model)?.upstream.provider;
+}
+function isAllowed(model: string, rules: any): boolean {
+  return isModelAllowed(model, providerOf(model), rules);
 }
 
-test('granting opus alias alone does NOT authorize when real model not allowed', () => {
-  // allowed_models has the alias but not the real model → resolved to
-  // glm-5.2, which is absent → denied.
-  assert.strictEqual(isAllowed('opus', ['opus']), false);
-});
-
-test('granting the real model authorizes the alias that maps to it', () => {
-  assert.strictEqual(isAllowed('opus', ['glm-5.2']), true);
-  assert.strictEqual(isAllowed('sonnet', ['deepseek-v4-pro']), true);
-  assert.strictEqual(isAllowed('haiku', ['MiniMax-M3']), true);
-});
-
-test('real model request is authorized by the real model in allowlist', () => {
-  assert.strictEqual(isAllowed('claude-opus-4-8', ['claude-opus-4-8']), true);
-});
-
-test('unrelated allowlist denies both alias and real model', () => {
-  assert.strictEqual(isAllowed('opus', ['MiniMax-M3']), false);
-  assert.strictEqual(isAllowed('claude-opus-4-8', ['MiniMax-M3']), false);
-});
-
-test('null allowlist (super_admin / bypass) permits everything', () => {
+test('null rules (super_admin / bypass) permits everything', () => {
   assert.strictEqual(isAllowed('opus', null), true);
   assert.strictEqual(isAllowed('claude-opus-4-8', null), true);
+});
+
+test('provider whitelist permits its models AND aliases routing to it', () => {
+  // glm provider 放开 → 直接命中 glm-5.3, 也命中 opus (opus 展开 upstream=glm)
+  const rules = { providers: ['glm'], extra_models: [], denied_models: [] };
+  assert.strictEqual(isAllowed('glm-5.3', rules), true);
+  assert.strictEqual(isAllowed('opus', rules), true);
+  // deepseek 未放开 → sonnet (展开到 deepseek) 被拒绝
+  assert.strictEqual(isAllowed('sonnet', rules), false);
+  assert.strictEqual(isAllowed('deepseek-v4-pro', rules), false);
+});
+
+test('extra_models 独立放开单个入站模型 (跨 provider 补丁)', () => {
+  const rules = { providers: [], extra_models: ['claude-opus-4-8'], denied_models: [] };
+  assert.strictEqual(isAllowed('claude-opus-4-8', rules), true);
+  // 未在 extra 且 provider 未开 → 拒绝
+  assert.strictEqual(isAllowed('claude-sonnet-4-6', rules), false);
+});
+
+test('denied_models 在 provider 全开下挖洞', () => {
+  const rules = { providers: ['gpt'], extra_models: [], denied_models: ['gpt-5.6-sol'] };
+  assert.strictEqual(isAllowed('gpt-5.6-luna', rules), true);
+  assert.strictEqual(isAllowed('gpt-5.6-sol', rules), false);
+});
+
+test('优先级 deny > extra > provider', () => {
+  const rules = { providers: ['glm'], extra_models: ['glm-5.3'], denied_models: ['glm-5.3'] };
+  // denied 胜出
+  assert.strictEqual(isAllowed('glm-5.3', rules), false);
+});
+
+test('providers=["*"] 通配符放开所有 provider', () => {
+  const rules = { providers: ['*'], extra_models: [], denied_models: [] };
+  assert.strictEqual(isAllowed('glm-5.3', rules), true);
+  assert.strictEqual(isAllowed('deepseek-v4-pro', rules), true);
+  assert.strictEqual(isAllowed('opus', rules), true);
+});
+
+test('空 rules 拒绝全部', () => {
+  const rules = { providers: [], extra_models: [], denied_models: [] };
+  assert.strictEqual(isAllowed('glm-5.3', rules), false);
+  assert.strictEqual(isAllowed('opus', rules), false);
 });
 
 // ─── Hidden aliases: routable but excluded from GET /models listing ───
@@ -156,7 +178,7 @@ test('resolved upstream carries provider for /v1/models item enrichment', () => 
   const providerFor = (m: string) => resolve(m)?.upstream.provider;
   // Real models: provider comes from the routed upstream
   assert.strictEqual(providerFor('deepseek-v4-pro'), 'deepseek');
-  assert.strictEqual(providerFor('glm-5.2'), 'glm');
+  assert.strictEqual(providerFor('glm-5.3'), 'glm');
   assert.strictEqual(providerFor('MiniMax-M3'), 'minimax');
   // Alias routes to a different provider than its name suggests — we still
   // want the ROUTED provider so the frontend groups aliases correctly.

@@ -93,6 +93,39 @@ export interface ResolvedUpstream {
   upstreamRouteId: string;
 }
 
+export interface PermissionRules {
+  providers: string[];
+  extra_models: string[];
+  denied_models: string[];
+}
+
+/**
+ * 判断请求是否被允许。
+ *
+ * 参照物:
+ *   - model:    客户端发的入站模型名 (parsedBody.model), 也是前端配置权限时的模型名
+ *   - provider: 路由后的 upstream.provider (config.json 里的稳定字符串)
+ *   - rules:    server /auth/token/introspect 返回的 permission_rules
+ *
+ * 优先级: denied_models > extra_models > providers。rules === null 视为无限制
+ * (super_admin / bypass)。三数组全空视为拒绝全部, 跟 server 端语义一致。
+ *
+ * providers 支持 "*" 通配符表示放开所有 provider (预留给未来使用, server 端也支持)。
+ */
+export function isModelAllowed(
+  model: string,
+  provider: string | undefined,
+  rules: PermissionRules | null,
+): boolean {
+  if (rules === null) return true;
+  if ((rules.denied_models || []).includes(model)) return false;
+  if ((rules.extra_models || []).includes(model)) return true;
+  const provs = rules.providers || [];
+  if (provs.includes("*")) return true;
+  if (provider && provs.includes(provider)) return true;
+  return false;
+}
+
 function ensureString(v: unknown, field: string): string {
   if (v === undefined || v === null) {
     throw new Error(`${field} is required`);
