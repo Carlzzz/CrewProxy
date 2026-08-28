@@ -53,6 +53,18 @@ export interface ModelRouteTarget {
   model?: string;
 }
 
+/** Default model IDs advertised to CrewCentral clients via GET /models.
+ *  Clients pull these on startup to seed their four Anthropic model slots
+ *  (ANTHROPIC_MODEL / DEFAULT_{HAIKU,SONNET,OPUS}_MODEL). All four fields are
+ *  required when the block is present — a partial default would leave the
+ *  client with a stale mix of old/new values. */
+export interface DefaultClientModels {
+  main: string;
+  haiku: string;
+  sonnet: string;
+  opus: string;
+}
+
 export interface ProxyConfig {
   port?: number;
   host?: string;
@@ -65,6 +77,7 @@ export interface ProxyConfig {
    * Code calls under the hood — they must resolve, but should not appear in
    * the user's model picker. */
   hiddenModels?: string[];
+  defaultClientModels?: DefaultClientModels;
   webSearch?: WebSearchConfig;
 }
 
@@ -74,6 +87,7 @@ export interface ProxyRuntimeContext {
   modelRoutesMap: Map<string, ModelRouteTarget>;
   /** Model keys hidden from GET /models but still routable (internal aliases). */
   hiddenModels?: Set<string>;
+  defaultClientModels?: DefaultClientModels;
   providerContextWindows?: ProviderContextWindowsConfig;
   codePlanPool?: CodePlanPoolManager;
   metrics?: MetricsCollector;
@@ -231,6 +245,23 @@ function normalizeProviderContextWindowSpec(v: unknown): ProviderContextWindowSp
   return spec;
 }
 
+function normalizeDefaultClientModels(v: unknown): DefaultClientModels {
+  if (v === null || typeof v !== 'object') {
+    throw new Error('defaultClientModels must be an object');
+  }
+  const o = v as Record<string, unknown>;
+  const fields: Array<keyof DefaultClientModels> = ['main', 'haiku', 'sonnet', 'opus'];
+  const out: Partial<DefaultClientModels> = {};
+  for (const key of fields) {
+    const value = o[key];
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new Error(`defaultClientModels.${key} must be a non-empty string`);
+    }
+    out[key] = value.trim();
+  }
+  return out as DefaultClientModels;
+}
+
 function normalizeProviderContextWindows(v: unknown): ProviderContextWindowsConfig {
   if (v === null || typeof v !== 'object') {
     throw new Error('providerContextWindows must be an object');
@@ -380,6 +411,9 @@ export function parseProxyConfigObject(raw: unknown): ProxyConfig {
   if (r.providerContextWindows !== undefined) {
     out.providerContextWindows = normalizeProviderContextWindows(r.providerContextWindows);
   }
+  if (r.defaultClientModels !== undefined) {
+    out.defaultClientModels = normalizeDefaultClientModels(r.defaultClientModels);
+  }
   return out;
 }
 
@@ -409,6 +443,7 @@ export function buildUpstreamsByIdMap(config: ProxyConfig): ProxyRuntimeContext 
     defaultUpstream: config.defaultUpstream,
     modelRoutesMap,
     hiddenModels,
+    defaultClientModels: config.defaultClientModels,
     webSearch: config.webSearch,
     providerContextWindows: config.providerContextWindows,
   };

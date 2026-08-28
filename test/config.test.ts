@@ -81,3 +81,29 @@ test('parseProxyConfigObject parses providerContextWindows with default and over
 test('parseProxyConfigObject throws when providerContextWindows.default is missing', () => {
   assert.throws(() => parseProxyConfigObject({ providerContextWindows: {} }), /default is required/);
 });
+
+test('parseProxyConfigObject parses defaultClientModels', () => {
+  const cfg = parseProxyConfigObject({
+    defaultClientModels: { main: 'a', haiku: 'b', sonnet: 'c', opus: 'd' },
+  });
+  assert.deepEqual(cfg.defaultClientModels, { main: 'a', haiku: 'b', sonnet: 'c', opus: 'd' });
+});
+
+test('parseProxyConfigObject leaves defaultClientModels undefined when absent', () => {
+  const cfg = parseProxyConfigObject({ port: 3456 });
+  assert.equal(cfg.defaultClientModels, undefined);
+});
+
+test('parseProxyConfigObject rejects partial defaultClientModels', () => {
+  assert.throws(
+    () => parseProxyConfigObject({ defaultClientModels: { main: 'a', haiku: 'b', sonnet: 'c' } }),
+    /opus must be a non-empty string/,
+  );
+});
+
+test('parseProxyConfigObject rejects empty-string defaultClientModels field', () => {
+  assert.throws(
+    () => parseProxyConfigObject({ defaultClientModels: { main: 'a', haiku: '', sonnet: 'c', opus: 'd' } }),
+    /haiku must be a non-empty string/,
+  );
+});

@@ -1587,7 +1587,9 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
               return isModelAllowed(realModel, provider, userInfo.permissionRules);
             });
 
-        sendJSONResponse(res, 200, { items: filteredItems });
+        const payload: { items: typeof filteredItems; defaults?: typeof ctx.defaultClientModels } = { items: filteredItems };
+        if (ctx.defaultClientModels) payload.defaults = ctx.defaultClientModels;
+        sendJSONResponse(res, 200, payload);
         return;
       }
 

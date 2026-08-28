@@ -152,6 +152,7 @@ if (fs.existsSync(configFilePath)) {
         ctx.upstreamsByIdMap = newCtx.upstreamsByIdMap;
         ctx.defaultUpstream = newCtx.defaultUpstream;
         ctx.modelRoutesMap = newCtx.modelRoutesMap;
+        ctx.defaultClientModels = newCtx.defaultClientModels;
         ctx.webSearch = newCtx.webSearch;
         codePlanPool.reconcileFromConfig(newConfig);
         currentConfig = newConfig;
