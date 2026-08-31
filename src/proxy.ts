@@ -877,10 +877,11 @@ async function handleRequest(
     const quotaKey = userInfo.userId ?? userInfo.name;
     const used = ctx.userQuota.getUsage(quotaKey);
     if (isQuotaExceeded(userInfo.quota, used)) {
-      const limit = userInfo.quota.daily_limit != null && used.dailyUsed >= userInfo.quota.daily_limit
-        ? `每日 ${userInfo.quota.daily_limit}`
-        : `本月 ${userInfo.quota.monthly_limit}`;
-      sendErrorResponse(res, 429, `[账户额度] 您的${limit} token 额度已用完（已用 ${used.dailyUsed}/${used.monthlyUsed}），请稍后再试或联系管理员调整额度。`, 'quota_exceeded');
+      if (userInfo.quota.daily_limit != null && used.dailyUsed >= userInfo.quota.daily_limit) {
+        sendErrorResponse(res, 429, `[账户额度] 您的每日 token 额度已用完（已用 ${used.dailyUsed} / 限额 ${userInfo.quota.daily_limit}），每日额度将于次日零点（东八区）重置。`, 'quota_exceeded');
+      } else {
+        sendErrorResponse(res, 429, `[账户额度] 您的本月 token 额度已用完（已用 ${used.monthlyUsed} / 限额 ${userInfo.quota.monthly_limit}），本月额度将于次月 1 日零点（东八区）重置。`, 'quota_exceeded');
+      }
       return;
     }
   }
