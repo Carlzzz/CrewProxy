@@ -93,6 +93,7 @@ export interface ProxyRuntimeContext {
   metrics?: MetricsCollector;
   quotaFetcher?: QuotaFetcher;
   tokenUsage?: TokenUsageTracker;
+  userQuota?: UserQuotaTracker;
   webSearch?: WebSearchConfig;
 }
 
@@ -100,6 +101,7 @@ import type { CodePlanPoolManager } from './codePlanPool';
 import type { MetricsCollector } from './metricsCollector';
 import type { QuotaFetcher } from './quotaFetcher';
 import type { TokenUsageTracker } from './tokenUsageTracker';
+import type { UserQuotaTracker } from './userQuotaTracker';
 
 export interface ResolvedUpstream {
   upstream: UpstreamConfig;

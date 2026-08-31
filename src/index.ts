@@ -7,6 +7,7 @@ import { MetricsCollector } from './metricsCollector';
 import { QuotaFetcher, detectQuotaProvider } from './quotaFetcher';
 import type { QuotaUpstreamRef } from './quotaFetcher';
 import { TokenUsageTracker } from './tokenUsageTracker';
+import { UserQuotaTracker } from './userQuotaTracker';
 import { JsonStateStore } from './stateStore';
 import { logger } from './logger';
 
@@ -40,6 +41,10 @@ ctx.metrics = metrics;
 const tokenUsageStore = new JsonStateStore(`${STATE_DIR}/token-usage.json`);
 const tokenUsage = new TokenUsageTracker({ store: tokenUsageStore });
 ctx.tokenUsage = tokenUsage;
+
+const userQuotaStore = new JsonStateStore(`${STATE_DIR}/user-quota.json`);
+const userQuota = new UserQuotaTracker({ store: userQuotaStore });
+ctx.userQuota = userQuota;
 
 function buildQuotaUpstreams(cfg: ProxyConfig): QuotaUpstreamRef[] {
   const out: QuotaUpstreamRef[] = [];
@@ -171,6 +176,7 @@ if (fs.existsSync(configFilePath)) {
 function shutdown(): void {
   quotaFetcher.stop();
   tokenUsageStore.flushSync();
+  userQuotaStore.flushSync();
   cooldownStore.flushSync();
   server.close(() => process.exit(0));
 }

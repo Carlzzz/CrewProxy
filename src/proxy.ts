@@ -110,6 +110,21 @@ function sendErrorResponse(res: http.ServerResponse, statusCode: number, message
   sendJSONResponse(res, statusCode, createAnthropicErrorBody(message, errorType));
 }
 
+// ─── User token quota helpers ───
+
+interface QuotaInfo {
+  enabled: boolean;
+  daily_limit: number | null;
+  monthly_limit: number | null;
+}
+
+export function isQuotaExceeded(quota: QuotaInfo, used: { dailyUsed: number; monthlyUsed: number }): boolean {
+  if (!quota.enabled) return false;
+  if (quota.daily_limit != null && used.dailyUsed >= quota.daily_limit) return true;
+  if (quota.monthly_limit != null && used.monthlyUsed >= quota.monthly_limit) return true;
+  return false;
+}
+
 /** Connect + first-byte timeout for upstream LLM calls. The timer is cleared
  *  as soon as `fetch` resolves (response headers arrived), so streaming
  *  response bodies are NOT cut by this — only the "connect and wait for first
@@ -266,7 +281,7 @@ function consumeBody(req: http.IncomingMessage): void {
 const AUTH_CACHE_MAX_SIZE = 1000;
 
 interface CacheEntry {
-  userInfo: { name: string; permissionRules: PermissionRules | null };
+  userInfo: { name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo };
   expiresAt: number;
 }
 const authCache = new Map<string, CacheEntry>();
@@ -304,9 +319,9 @@ function extractClientApiKey(req: http.IncomingMessage): string | null {
   return null;
 }
 
-async function authenticateRequest(token: string): Promise<{ name: string; permissionRules: PermissionRules | null } | null> {
+async function authenticateRequest(token: string): Promise<{ name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo } | null> {
   if (isAuthBypassed()) {
-    return { name: 'bypass', permissionRules: null };
+    return { name: 'bypass', permissionRules: null, quota: { enabled: false, daily_limit: null, monthly_limit: null } };
   }
 
   const cacheKey = token;
@@ -322,7 +337,7 @@ async function authenticateRequest(token: string): Promise<{ name: string; permi
 
   const authHost = getAuthHost();
   const proxyKey = getProxyApiKey();
-  let userInfo: { name: string; permissionRules: PermissionRules | null } | null = null;
+  let userInfo: { name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo } | null = null;
 
   if (authHost) {
     logger.verbose('[auth] Trying introspect first (authHost configured)');
@@ -337,7 +352,7 @@ async function authenticateRequest(token: string): Promise<{ name: string; permi
 
   if (!userInfo && proxyKey) {
     if (token === proxyKey) {
-      userInfo = { name: 'local', permissionRules: null };
+      userInfo = { name: 'local', permissionRules: null, quota: { enabled: false, daily_limit: null, monthly_limit: null } };
     }
   }
 
@@ -355,7 +370,7 @@ async function authenticateRequest(token: string): Promise<{ name: string; permi
   return null;
 }
 
-async function fetchUserInfo(token: string): Promise<{ name: string; permissionRules: PermissionRules | null } | null> {
+async function fetchUserInfo(token: string): Promise<{ name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo } | null> {
   const authHost = getAuthHost();
   if (!authHost) {
     logger.error('Auth host not configured (WOICLAW_AUTH_HOST)');
@@ -429,7 +444,21 @@ async function fetchUserInfo(token: string): Promise<{ name: string; permissionR
       };
     }
 
-    return { name: name.trim(), permissionRules };
+    const userId = getNestedField(body, 'data.user_id');
+    const userIdStr = typeof userId === 'string' && userId ? userId : undefined;
+
+    const rawQuota = getNestedField(body, 'data.quota');
+    let quota: QuotaInfo = { enabled: false, daily_limit: null, monthly_limit: null };
+    if (rawQuota && typeof rawQuota === 'object' && !Array.isArray(rawQuota)) {
+      const q = rawQuota as any;
+      quota = {
+        enabled: q.enabled === true,
+        daily_limit: typeof q.daily_limit === 'number' ? q.daily_limit : null,
+        monthly_limit: typeof q.monthly_limit === 'number' ? q.monthly_limit : null,
+      };
+    }
+
+    return { name: name.trim(), permissionRules, userId: userIdStr, quota };
   } catch (err) {
     logger.error('Auth error:', err);
     return null;
@@ -816,9 +845,9 @@ async function handleRequest(
   }
 
   const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
-  let userInfo: { name: string; permissionRules: PermissionRules | null };
+  let userInfo: { name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo };
   if (typeof headerUser === 'string' && headerUser.trim()) {
-    userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules };
+    userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules, quota: { enabled: false, daily_limit: null, monthly_limit: null } };
   } else {
     userInfo = authResult;
   }
@@ -841,6 +870,19 @@ async function handleRequest(
     const label = modelId === model ? model : `${model} (${modelId})`;
     sendErrorResponse(res, 403, `Model ${label} is not allowed for your account.`, 'permission_error');
     return;
+  }
+
+  // ─── User Token Quota Check ───
+  if (userInfo.quota.enabled && ctx.userQuota) {
+    const quotaKey = userInfo.userId ?? userInfo.name;
+    const used = ctx.userQuota.getUsage(quotaKey);
+    if (isQuotaExceeded(userInfo.quota, used)) {
+      const limit = userInfo.quota.daily_limit != null && used.dailyUsed >= userInfo.quota.daily_limit
+        ? `每日 ${userInfo.quota.daily_limit}`
+        : `本月 ${userInfo.quota.monthly_limit}`;
+      sendErrorResponse(res, 429, `[账户额度] 您的${limit} token 额度已用完（已用 ${used.dailyUsed}/${used.monthlyUsed}），请稍后再试或联系管理员调整额度。`, 'quota_exceeded');
+      return;
+    }
   }
 
   const codePlanPoolKey = upstreamRouteId || '__default__';
@@ -928,6 +970,9 @@ async function handleRequest(
   const startMs = new Date(startTime).getTime();
   const recordMetric = (success: boolean, inTok: number, outTok: number): void => {
     ctx.tokenUsage?.record(upstreamRouteId ?? '__default__', (inTok || 0) + (outTok || 0));
+    if (success && userInfo.quota.enabled && ctx.userQuota) {
+      ctx.userQuota.record(userInfo.userId ?? userInfo.name, (inTok || 0) + (outTok || 0));
+    }
     ctx.metrics?.record({
       upstreamId: upstreamRouteId ?? '__default__',
       credentialId: usageExtra.routing_key ?? undefined,
@@ -1540,9 +1585,9 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
         }
 
         const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
-        let userInfo: { name: string; permissionRules: PermissionRules | null };
+        let userInfo: { name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo };
         if (typeof headerUser === 'string' && headerUser.trim()) {
-          userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules };
+          userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules, quota: { enabled: false, daily_limit: null, monthly_limit: null } };
         } else {
           userInfo = authResult;
         }
