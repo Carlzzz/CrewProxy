@@ -847,7 +847,7 @@ async function handleRequest(
   const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
   let userInfo: { name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo };
   if (typeof headerUser === 'string' && headerUser.trim()) {
-    userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules, quota: { enabled: false, daily_limit: null, monthly_limit: null } };
+    userInfo = { ...authResult, name: decodeURIComponent(headerUser.trim()) };
   } else {
     userInfo = authResult;
   }
@@ -1587,7 +1587,7 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
         const headerUser = req.headers['x-llm-proxy-user'] || req.headers['x-show-name'];
         let userInfo: { name: string; permissionRules: PermissionRules | null; userId?: string; quota: QuotaInfo };
         if (typeof headerUser === 'string' && headerUser.trim()) {
-          userInfo = { name: decodeURIComponent(headerUser.trim()), permissionRules: authResult.permissionRules, quota: { enabled: false, daily_limit: null, monthly_limit: null } };
+          userInfo = { ...authResult, name: decodeURIComponent(headerUser.trim()) };
         } else {
           userInfo = authResult;
         }
