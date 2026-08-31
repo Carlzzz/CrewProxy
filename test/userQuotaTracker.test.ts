@@ -47,3 +47,10 @@ test('持久化 dump/restore', () => {
   const u = t2.getUsage('u1', tsOf('2026-08-31T11:00:00Z'));
   assert.equal(u.dailyUsed, 100);
 });
+
+test('getUsage 对非有限 ts 安全返回 0', () => {
+  const t = new UserQuotaTracker();
+  const u = t.getUsage('u1', NaN);
+  assert.equal(u.dailyUsed, 0);
+  assert.equal(u.monthlyUsed, 0);
+});

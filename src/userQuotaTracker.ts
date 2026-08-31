@@ -32,15 +32,20 @@ export class UserQuotaTracker {
     this.now = opts.now ?? Date.now;
     this.store = opts.store;
     if (this.store) {
-      const snap = this.store.load<Snapshot>();
-      if (snap) {
-        try {
-          this.restore(snap);
-          logger.info(`[userQuota] restored ${this.byUser.size} user(s) from persisted state`);
-        } catch (err) {
-          logger.warn('[userQuota] restore failed, starting empty:', err);
-          this.byUser.clear();
+      try {
+        const snap = this.store.load<Snapshot>();
+        if (snap) {
+          try {
+            this.restore(snap);
+            logger.info(`[userQuota] restored ${this.byUser.size} user(s) from persisted state`);
+          } catch (err) {
+            logger.warn('[userQuota] restore failed, starting empty:', err);
+            this.byUser.clear();
+          }
         }
+      } catch (err) {
+        logger.warn('[userQuota] store.load failed, starting empty:', err);
+        this.byUser.clear();
       }
     }
   }
@@ -67,14 +72,19 @@ export class UserQuotaTracker {
   }
 
   getUsage(userId: string, ts?: number): { dailyUsed: number; monthlyUsed: number } {
-    const t = ts === undefined ? this.now() : ts;
-    const { day, month } = tz8Keys(t);
-    const e = this.byUser.get(userId);
-    if (!e) return { dailyUsed: 0, monthlyUsed: 0 };
-    return {
-      dailyUsed: e.dailyKey === day ? e.dailyUsed : 0,
-      monthlyUsed: e.monthlyKey === month ? e.monthlyUsed : 0,
-    };
+    try {
+      const t = ts === undefined ? this.now() : ts;
+      const { day, month } = tz8Keys(t);
+      const e = this.byUser.get(userId);
+      if (!e) return { dailyUsed: 0, monthlyUsed: 0 };
+      return {
+        dailyUsed: e.dailyKey === day ? e.dailyUsed : 0,
+        monthlyUsed: e.monthlyKey === month ? e.monthlyUsed : 0,
+      };
+    } catch (err) {
+      logger.error('[userQuota] getUsage failed:', err);
+      return { dailyUsed: 0, monthlyUsed: 0 };
+    }
   }
 
   dump(): Snapshot {
