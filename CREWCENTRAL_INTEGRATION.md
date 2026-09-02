@@ -57,10 +57,41 @@ Authorization: Bearer <access_token>
   "rc": 0,
   "data": {
     "user_id": "user-uuid",
-    "name": "用户名或邮箱"
+    "name": "用户名或邮箱",
+    "permission_rules": {
+      "providers": ["openai", "anthropic"],
+      "extra_models": [],
+      "denied_models": []
+    },
+    "quota": { "enabled": true, "daily_limit": 100, "monthly_limit": 3000 }
   }
 }
 ```
+
+> `permission_rules` 为 `null` 表示角色无限制（如 `super_admin`）。Proxy 可据此
+> 决定哪些 provider/model 放行；`quota` 用于客户端或后续代理层做额度控制。
+>
+> 当 `Bearer` 传入的是 `wc_` 开头的长效 key 时，响应会额外带 `client_type`
+> 字段（`anthropic` / `openai` / `im` / `mcp` / `self_hosted` / `admin`），用于
+> 按客户端类型做差异化策略。
+
+## 长效 API Key（`wc_` 前缀）
+
+适用于第三方客户端（如 Claude Code / Anthropic SDK）在公司受监管的网络下调用
+Proxy 转发到后端大模型：管理员或用户先在 CrewCentral 签发一个长效 key（`wc_`
+前缀 + 32 字节 url-safe），写入客户端的 `*_API_KEY` / `Authorization` 头。
+
+签发后的明文 key **仅展示一次**，存库只保留 SHA-256 哈希与 `wc_<8>` 前缀；
+过期/吊销/前缀错误均返回 401。
+
+```bash
+# 典型示例：Anthropic SDK 客户端
+export ANTHROPIC_BASE_URL=https://your-crewcentral-host.com/woicrew   # 指向 Proxy
+export ANTHROPIC_API_KEY=wc_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+Proxy 收到 `Authorization: Bearer wc_xxx` 后会通过 `/auth/token/introspect`
+反查用户身份与权限，沿用同一份用量统计（按 `data.name` 归属）。
 
 ## 完整示例
 
@@ -70,5 +101,8 @@ WOICLAW_AUTH_HOST=https://crew.ambilight.com/woicrew
 WOICLAW_AUTH_USER_PATH=/api/v1/auth/token/introspect
 WOICLAW_AUTH_USE_BEARER=true
 WOICLAW_AUTH_METHOD=POST
+WOICLAW_AUTH_SUCCESS_FIELD=rc
+WOICLAW_AUTH_SUCCESS_VALUE=0
+WOICLAW_AUTH_NAME_FIELD=data.name
 ```
 
