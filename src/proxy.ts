@@ -776,7 +776,7 @@ async function handleAnthropicStreamResponse(
       output_content: outputContent,
     } as UsageLogExtra);
 
-    recordMetric?.(state.sawMessageStop, state.inputTokens, state.outputTokens);
+    recordMetric?.(state.sawMessageStop, state.inputTokens, state.outputTokens, state.cachedInputTokens);
 
     res.end();
   }
@@ -969,10 +969,10 @@ async function handleRequest(
   // `usageExtra.routing_key` is reassigned below (after the credential loop);
   // the closure reads it at call time, so all exit calls see the final credential.
   const startMs = new Date(startTime).getTime();
-  const recordMetric = (success: boolean, inTok: number, outTok: number): void => {
+  const recordMetric = (success: boolean, inTok: number, outTok: number, cachedTok: number = 0): void => {
     ctx.tokenUsage?.record(upstreamRouteId ?? '__default__', (inTok || 0) + (outTok || 0));
     if (success && userInfo.quota.enabled && ctx.userQuota) {
-      ctx.userQuota.record(userInfo.userId ?? userInfo.name, (inTok || 0) + (outTok || 0));
+      ctx.userQuota.record(userInfo.userId ?? userInfo.name, (inTok || 0) + (outTok || 0) + (cachedTok || 0));
     }
     ctx.metrics?.record({
       upstreamId: upstreamRouteId ?? '__default__',
@@ -1438,7 +1438,7 @@ async function handleRequest(
       response_size: JSON.stringify(anthropicResp).length,
     } as UsageLogExtra);
 
-    recordMetric(true, inputTokens, outputTokens);
+    recordMetric(true, inputTokens, outputTokens, extractCachedInputTokensFromUsage(anthropicResp.usage));
     if (trimmedTokens > 0) res.setHeader('x-crew-trimmed-tokens', String(trimmedTokens));
     sendJSONResponse(res, 200, anthropicResp);
   } finally {
