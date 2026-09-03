@@ -647,7 +647,7 @@ async function handleAnthropicStreamResponse(
   startTime: string,
   upstreamReq: any,
   extra: Partial<UsageLogExtra>,
-  recordMetric?: (success: boolean, inputTokens: number, outputTokens: number) => void,
+  recordMetric?: (success: boolean, inputTokens: number, outputTokens: number, cachedTokens?: number) => void,
   trimmedTokens: number = 0,
 ): Promise<void> {
   res.writeHead(200, {
