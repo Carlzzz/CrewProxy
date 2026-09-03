@@ -1572,7 +1572,7 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
         return;
       }
 
-      if (method === 'GET' && pathname === '/models') {
+      if (method === 'GET' && (pathname === '/models' || pathname === '/v1/models')) {
         const clientApiKey = extractClientApiKey(req);
         if (!clientApiKey) {
           sendErrorResponse(res, 401, 'Missing API key. Provide x-api-key header or Authorization: Bearer token.', 'authentication_error');
@@ -1632,6 +1632,23 @@ export function createProxyServer(ctx: ProxyRuntimeContext): http.Server {
               const provider = r?.upstream.provider ?? item.provider;
               return isModelAllowed(realModel, provider, userInfo.permissionRules);
             });
+
+        if (pathname === '/v1/models') {
+          // Anthropic List Models 标准格式
+          const data = filteredItems.map(item => ({
+            type: 'model',
+            id: item.model_id,
+            display_name: item.model_alias,
+            created_at: new Date(0).toISOString(),
+          }));
+          sendJSONResponse(res, 200, {
+            data,
+            has_more: false,
+            first_id: data.length > 0 ? data[0].id : null,
+            last_id: data.length > 0 ? data[data.length - 1].id : null,
+          });
+          return;
+        }
 
         const payload: { items: typeof filteredItems; defaults?: typeof ctx.defaultClientModels } = { items: filteredItems };
         if (ctx.defaultClientModels) payload.defaults = ctx.defaultClientModels;
